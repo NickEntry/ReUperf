@@ -28,7 +28,7 @@ jobs:
           g++ \
           clang \
           lld \
-          libnlohmann-json-dev
+          nlohmann-json3-dev
 
     - name: Configure CMake
       run: |
@@ -40,9 +40,21 @@ jobs:
         cd build
         make -j$(nproc)
 
+    - name: Run tests
+      run: |
+        cd build
+        if [ -f "./thread_scheduler" ]; then
+          echo "✅ Build successful, executable size:"
+          ls -lh ./thread_scheduler
+        else
+          echo "❌ Build failed: executable not found"
+          exit 1
+        fi
+
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: thread-scheduler
-        path: build/thread-scheduler  # 替换为你的可执行文件名
+        name: thread_scheduler_binary
+        path: build/thread_scheduler
+        retention-days: 7
 
