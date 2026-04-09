@@ -1,84 +1,74 @@
-name: C++ CI/CD Pipeline
+name: Build Thread Scheduler
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main ]
   pull_request:
-    branches: [ main, master ]
+    branches: [ main ]
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    
+
     steps:
-    - name: Checkout repository
+    - name: Checkout code
       uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-    
-    - name: Clean previous builds
+
+    - name: Clean and force reconfigure
       run: |
-        rm -rf build/
-        rm -f CMakeCache.txt
+        rm -rf build/ CMakeCache.txt CMakeFiles/
         mkdir -p build
-    
-    - name: Install dependencies
+
+    - name: Install minimal dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y \
-          build-essential \
           cmake \
-          ninja-build \
-          clang \
-          lld \
-          libstdc++-12-dev \
+          make \
+          g++ \
           nlohmann-json3-dev
-        echo "✅ Dependencies installed successfully"
-    
-    - name: Configure CMake
+
+    - name: Configure CMake (强制覆盖为通用Linux配置)
       run: |
         cd build
+        # 关键：设置 CMAKE_SYSTEM_NAME 为通用值，避免Termux检测
         cmake .. \
-          -DCMAKE_C_COMPILER=clang \
-          -DCMAKE_CXX_COMPILER=clang++ \
+          -DCMAKE_SYSTEM_NAME=Linux \
+          -DCMAKE_C_COMPILER=gcc \
+          -DCMAKE_CXX_COMPILER=g++ \
           -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-          -G "Unix Makefiles"
-        echo "CMake configuration completed"
-    
-    - name: Build project
+          -DBUILD_STATIC=OFF \
+          -DCMAKE_CXX_FLAGS="-Wall -Wextra -O2" \
+          -DCMAKE_CXX_STANDARD=17 \
+          -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+          -DCMAKE_CXX_EXTENSIONS=OFF
+        echo "CMake configuration complete"
+
+    - name: Build with verbose output
       run: |
         cd build
-        make -j$(nproc) VERBOSE=1
-        echo "Build completed successfully"
-    
-    - name: List build artifacts
-      run: |
-        cd build
-        echo "=== Build Directory Contents ==="
-        find . -type f -executable
-        echo "=== File Sizes ==="
-        du -sh ./*
-    
-    - name: Upload build artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: thread-scheduler-binary
-        path: |
-          build/thread_scheduler
-          build/compile_commands.json
-        retention-days: 7
-    
-    - name: Run basic test
+        make VERBOSE=1
+        if [ $? -ne 0 ]; then
+          echo "Build failed, retrying with more details..."
+          make -j1 VERBOSE=1
+        fi
+
+    - name: Check executable
       run: |
         if [ -f "build/thread_scheduler" ]; then
-          cd build
-          echo "=== Testing executable ==="
-          ./thread_scheduler --version || echo "Version check not available"
-          ./thread_scheduler --help || echo "Help not available"
-          echo "✅ Executable is functional"
+          echo "✅ Build successful!"
+          file build/thread_scheduler
+          ldd build/thread_scheduler 2>/dev/null || echo "ldd not available"
         else
           echo "❌ Executable not found"
+          find build/ -type f -name "*" | head -20
           exit 1
         fi
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: thread-scheduler-bin
+        path: build/thread_scheduler
+        retention-days: 7
 
