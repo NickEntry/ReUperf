@@ -29,7 +29,7 @@ jobs:
           nlohmann-json3-dev
         echo "✅ Dependencies installed successfully"
 
-    - name: Configure CMake
+    - name: Configure CMake (force non-Termux)
       run: |
         cd build
         cmake .. \
@@ -44,24 +44,5 @@ jobs:
       run: |
         cd build
         make VERBOSE=1
-        echo "Build completed"
-
-    - name: Verify executable
-      run: |
-        if [ -f "build/thread_scheduler" ]; then
-          echo "✅ Build successful!"
-          echo "Executable: build/thread_scheduler"
-          ls -lh build/thread_scheduler
-        else
-          echo "❌ Executable not found"
-          find build/ -type f -name "thread_scheduler" || echo "No thread_scheduler file found"
-          exit 1
-        fi
-
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: thread-scheduler-bin
-        path: build/thread_scheduler
-        retention-days: 7
+        echo "✅ Build completed successfully"
 

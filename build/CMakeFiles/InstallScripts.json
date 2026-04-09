@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/data/data/com.termux/files/home/thread_scheduler/build/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

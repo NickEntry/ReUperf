@@ -1,1 +1,0 @@
-/data/data/com.termux/files/usr/bin/c++  -Wall -Wextra -O2 -O3 -DNDEBUG -Xlinker --dependency-file=CMakeFiles/thread_scheduler.dir/link.d CMakeFiles/thread_scheduler.dir/main.cpp.o -o thread_scheduler
