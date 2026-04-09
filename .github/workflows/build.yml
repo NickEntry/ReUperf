@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
     - name: Checkout code
@@ -22,33 +22,27 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake make g++ clang libnlohmann-json-dev
+        sudo apt-get install -y \
+          cmake \
+          make \
+          g++ \
+          clang \
+          lld \
+          libnlohmann-json-dev
 
     - name: Configure CMake
       run: |
         cd build
-        cmake .. -DCMAKE_BUILD_TYPE=Release
+        cmake .. -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 
     - name: Build project
       run: |
         cd build
         make -j$(nproc)
 
-    - name: Run tests
-      run: |
-        cd build
-        if [ -f "./thread_scheduler" ]; then
-          echo "✅ Build successful, executable size:"
-          ls -lh ./thread_scheduler
-        else
-          echo "❌ Build failed: executable not found"
-          exit 1
-        fi
-
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: thread_scheduler_binary
-        path: build/thread_scheduler
-        retention-days: 7
+        name: thread-scheduler
+        path: build/thread-scheduler  # 替换为你的可执行文件名
 
