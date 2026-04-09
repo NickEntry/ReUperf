@@ -8,7 +8,8 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    # ✅ 关键点：使用 Ubuntu 24.04，自带 GCC 13 和 C++20 支持
+    runs-on: ubuntu-24.04
 
     steps:
     - name: Checkout code
@@ -19,35 +20,24 @@ jobs:
         rm -rf build/ CMakeCache.txt CMakeFiles/
         mkdir -p build
 
-    # --- 修改点 1: 安装 GCC-13 ---
+    # ✅ 关键点：简化的依赖安装，只安装必要的库
+    # Ubuntu 24.04 默认已有 GCC 13，无需手动安装编译器
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y \
-          cmake \
-          make \
-          g++ \
-          gcc \
-          nlohmann-json3-dev \
-          gcc-13 \
-          g++-13
-        echo "✅ Dependencies installed successfully"
+        sudo apt-get install -y cmake ninja-build libjsoncpp-dev
 
-    # --- 修改点 2: 强制指定 GCC-13 和 C++20 ---
+    # ✅ 关键点：配置 CMake，明确指定 C++ 标准
     - name: Configure CMake
       run: |
-        cd build
-        cmake .. \
-          -DCMAKE_C_COMPILER=gcc-13 \
-          -DCMAKE_CXX_COMPILER=g++-13 \
-          -DCMAKE_CXX_STANDARD=20 \
+        cmake -B build -S . \
           -DCMAKE_BUILD_TYPE=Release \
-          -DBUILD_STATIC=OFF
-        echo "CMake configuration completed"
+          -DCMAKE_CXX_STANDARD=20 \
+          -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+          -GNinja
 
+    # ✅ 关键点：执行构建
     - name: Build with verbose output
       run: |
-        cd build
-        make VERBOSE=1
-        echo "✅ Build completed successfully"
+        cmake --build build --config Release --verbose
 
