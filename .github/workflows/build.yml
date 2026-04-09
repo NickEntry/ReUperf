@@ -11,52 +11,44 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout source code
+    - name: Checkout code
       uses: actions/checkout@v4
+
+    - name: Clean build directory
+      run: |
+        rm -rf build/
+        mkdir -p build/
 
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake g++ clang make pkg-config
-
-    - name: Detect environment (Termux or Linux)
-      id: env
-      run: |
-        if [ -d "/data/data/com.termux" ]; then
-          echo "IS_TERMUX=true" >> $GITHUB_ENV
-        else
-          echo "IS_TERMUX=false" >> $GITHUB_ENV
-        fi
+        sudo apt-get install -y cmake make g++ clang libnlohmann-json-dev
 
     - name: Configure CMake
       run: |
-        mkdir -p build
         cd build
-        if [ "$IS_TERMUX" = "true" ]; then
-          cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
-        else
-          cmake .. -DCMAKE_BUILD_TYPE=Release
-        fi
+        cmake .. -DCMAKE_BUILD_TYPE=Release
 
     - name: Build project
       run: |
         cd build
         make -j$(nproc)
 
-    - name: Run tests (if any)
+    - name: Run tests
       run: |
         cd build
         if [ -f "./thread_scheduler" ]; then
-          echo "✅ Executable built successfully."
-          # ./thread_scheduler  # 如果有测试命令，取消注释
+          echo "✅ Build successful, executable size:"
+          ls -lh ./thread_scheduler
         else
-          echo "❌ Executable not found!"
+          echo "❌ Build failed: executable not found"
           exit 1
         fi
 
-    - name: Upload artifact (optional)
+    - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: thread_scheduler_binary
         path: build/thread_scheduler
+        retention-days: 7
 
