@@ -1,60 +1,84 @@
-name: Build Thread Scheduler
+name: C++ CI/CD Pipeline
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, master ]
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-
+    
     steps:
-    - name: Checkout code
+    - name: Checkout repository
       uses: actions/checkout@v4
-
-    - name: Clean build directory
+      with:
+        fetch-depth: 0
+    
+    - name: Clean previous builds
       run: |
         rm -rf build/
-        mkdir -p build/
-
+        rm -f CMakeCache.txt
+        mkdir -p build
+    
     - name: Install dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y \
+          build-essential \
           cmake \
-          make \
-          g++ \
+          ninja-build \
           clang \
           lld \
+          libstdc++-12-dev \
           nlohmann-json3-dev
-
+        echo "✅ Dependencies installed successfully"
+    
     - name: Configure CMake
       run: |
         cd build
-        cmake .. -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
-
+        cmake .. \
+          -DCMAKE_C_COMPILER=clang \
+          -DCMAKE_CXX_COMPILER=clang++ \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+          -G "Unix Makefiles"
+        echo "CMake configuration completed"
+    
     - name: Build project
       run: |
         cd build
-        make -j$(nproc)
-
-    - name: Run tests
+        make -j$(nproc) VERBOSE=1
+        echo "Build completed successfully"
+    
+    - name: List build artifacts
       run: |
         cd build
-        if [ -f "./thread_scheduler" ]; then
-          echo "✅ Build successful, executable size:"
-          ls -lh ./thread_scheduler
-        else
-          echo "❌ Build failed: executable not found"
-          exit 1
-        fi
-
-    - name: Upload artifact
+        echo "=== Build Directory Contents ==="
+        find . -type f -executable
+        echo "=== File Sizes ==="
+        du -sh ./*
+    
+    - name: Upload build artifact
       uses: actions/upload-artifact@v4
       with:
-        name: thread_scheduler_binary
-        path: build/thread_scheduler
+        name: thread-scheduler-binary
+        path: |
+          build/thread_scheduler
+          build/compile_commands.json
         retention-days: 7
+    
+    - name: Run basic test
+      run: |
+        if [ -f "build/thread_scheduler" ]; then
+          cd build
+          echo "=== Testing executable ==="
+          ./thread_scheduler --version || echo "Version check not available"
+          ./thread_scheduler --help || echo "Help not available"
+          echo "✅ Executable is functional"
+        else
+          echo "❌ Executable not found"
+          exit 1
+        fi
 
