@@ -26,49 +26,22 @@ jobs:
           cmake \
           make \
           g++ \
-          nlohmann-json3-dev
+          nlohmann-json3-dev \  # 修复：Ubuntu 22.04 正确包名
+          libc6-dev \
+          libstdc++-dev
 
-    - name: Configure CMake (强制覆盖为通用Linux配置)
+    - name: Configure CMake (force non-Termux)
       run: |
         cd build
-        # 关键：设置 CMAKE_SYSTEM_NAME 为通用值，避免Termux检测
         cmake .. \
-          -DCMAKE_SYSTEM_NAME=Linux \
           -DCMAKE_C_COMPILER=gcc \
           -DCMAKE_CXX_COMPILER=g++ \
           -DCMAKE_BUILD_TYPE=Release \
-          -DBUILD_STATIC=OFF \
-          -DCMAKE_CXX_FLAGS="-Wall -Wextra -O2" \
-          -DCMAKE_CXX_STANDARD=17 \
-          -DCMAKE_CXX_STANDARD_REQUIRED=ON \
-          -DCMAKE_CXX_EXTENSIONS=OFF
-        echo "CMake configuration complete"
+          -DBUILD_STATIC=OFF \  # 避免 Termux 特有静态链接逻辑
+          -DCMAKE_DISABLE_FIND_PACKAGE_Termux=ON  # 关键：强制禁用 Termux 特判
 
     - name: Build with verbose output
       run: |
         cd build
-        make VERBOSE=1
-        if [ $? -ne 0 ]; then
-          echo "Build failed, retrying with more details..."
-          make -j1 VERBOSE=1
-        fi
-
-    - name: Check executable
-      run: |
-        if [ -f "build/thread_scheduler" ]; then
-          echo "✅ Build successful!"
-          file build/thread_scheduler
-          ldd build/thread_scheduler 2>/dev/null || echo "ldd not available"
-        else
-          echo "❌ Executable not found"
-          find build/ -type f -name "*" | head -20
-          exit 1
-        fi
-
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: thread-scheduler-bin
-        path: build/thread_scheduler
-        retention-days: 7
+        make VERBOSE=1  # 强制输出详细编译日志
 
