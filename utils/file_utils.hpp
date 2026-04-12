@@ -314,15 +314,29 @@ inline std::string get_thread_name(int pid, int tid) {
 }
 
 inline std::string get_cgroup_path(int pid, const std::string& controller) {
-    static std::unordered_map<std::pair<int, std::string>, std::pair<std::string, int64_t>, 
-        std::hash<std::pair<int, std::string>>> cache;
+    struct CgroupCacheKey {
+        int pid;
+        std::string controller;
+        
+        bool operator==(const CgroupCacheKey& other) const {
+            return pid == other.pid && controller == other.controller;
+        }
+    };
+    
+    struct CgroupCacheKeyHash {
+        size_t operator()(const CgroupCacheKey& k) const {
+            return std::hash<int>{}(k.pid) ^ (std::hash<std::string>{}(k.controller) << 1);
+        }
+    };
+    
+    static std::unordered_map<CgroupCacheKey, std::pair<std::string, int64_t>, CgroupCacheKeyHash> cache;
     static std::mutex cache_mutex;
     static constexpr int64_t kCacheTTLMs = 100;
     
     auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     
-    std::pair<int, std::string> key = {pid, controller};
+    CgroupCacheKey key{pid, controller};
     
     {
         std::lock_guard<std::mutex> lock(cache_mutex);

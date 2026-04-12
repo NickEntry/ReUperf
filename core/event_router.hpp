@@ -65,7 +65,7 @@ public:
         add_event(pid, false);
     }
     
-    std::set<int> get_tracked_pids() const {
+    std::unordered_set<int> get_tracked_pids() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return tracked_pids_;
     }
@@ -84,8 +84,8 @@ private:
     int throttle_ms_;
     std::atomic<bool> running_;
     std::thread thread_;
-    std::mutex mutex_;
-    std::condition_variable cv_;
+    mutable std::mutex mutex_;
+    mutable std::condition_variable cv_;
     EventHandler on_event_;
     
     std::queue<ProcEvent> event_queue_;

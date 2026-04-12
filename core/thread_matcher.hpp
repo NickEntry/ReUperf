@@ -131,7 +131,7 @@ public:
     }
 
     MatchResult match(const std::string& proc_name, const std::string& thread_name,
-                      ProcessState actual_state, int pid, const std::string& cmdline = "") {
+                      ProcessState actual_state, int /*pid*/, const std::string& cmdline = "") {
         MatchResult result;
         result.effective_state = actual_state;
 
@@ -251,7 +251,7 @@ public:
 
     MatchResult match_process_only(const std::string& proc_name,
                                    const std::string& thread_name,
-                                   ProcessState actual_state, int pid,
+                                   ProcessState actual_state, int /*pid*/,
                                    const std::string& cmdline = "") {
         MatchResult result;
         result.effective_state = actual_state;

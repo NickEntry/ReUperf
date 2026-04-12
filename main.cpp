@@ -254,7 +254,7 @@ inline void dispatch_pids_to_workers(
         std::string cmdline = FileUtils::get_process_cmdline(pid);
 
         if (skip_topapp_cgroup) {
-            std::string cgroup = FileUtils::get_cgroup_path_cached(pid, "cpuset");
+            std::string cgroup = FileUtils::get_cgroup_path(pid, "cpuset");
             if (cgroup.find("top-app") != std::string::npos) continue;
         }
 
@@ -471,7 +471,7 @@ int main(int /*argc*/, char* argv[]) {
         }
         for (int pid : dead_pids) {
             LOG_I("Main", "Cleaning up dead pid: " + std::to_string(pid));
-            cache_ptr->remove(pid);
+            cache_ptr->reset_for_pid(pid);
         }
     });
     
