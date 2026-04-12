@@ -47,7 +47,8 @@ public:
     void set_configs(std::shared_ptr<ThreadMatcher> matcher,
                      std::shared_ptr<CpusetSetter> cpuset,
                      std::shared_ptr<PrioritySetter> prio,
-                     std::shared_ptr<CpuctlSetter> cpuctl,                     std::shared_ptr<ThreadCache> cache) {
+                     std::shared_ptr<CpuctlSetter> cpuctl,
+                     std::shared_ptr<ThreadCache> cache) {
         matcher_ = matcher;
         cpuset_ = cpuset;
         prio_ = prio;
@@ -96,7 +97,8 @@ public:
     }
 
 private:
-    std::string name_;    std::atomic<bool> running_;
+    std::string name_;
+    std::atomic<bool> running_;
     std::atomic<bool> started_;
     std::thread thread_;
     std::queue<DispatchTask> task_queue_;
@@ -145,7 +147,8 @@ private:
         bool sched_changed = false;
 
         if (auto entry = cache->lookup(task.pid, task.tid, task.thread_name, task.state)) {
-            auto applied = cache->get_applied_result(task.pid, task.tid);            if (applied && is_result_equal(*applied, entry->result)) {
+            auto applied = cache->get_applied_result(task.pid, task.tid);
+            if (applied && is_result_equal(*applied, entry->result)) {
                 auto expected_cpus = cpuset->get_cpus_for_affinity(applied->affinity_class, applied->effective_state);
                 affinity_changed = CpuMask::is_affinity_changed_from_status(task.tid, expected_cpus);
                 int expected_prio = matcher->get_prio_value(applied->prio_class, applied->effective_state);

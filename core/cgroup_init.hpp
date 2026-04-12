@@ -104,14 +104,27 @@ private:
                 }
             }
 #ifdef __ANDROID__
-            usleep(10000);
-#endif
-
+            // ✅ P1 改进：用重试机制替代固定延迟
+            constexpr int kMaxCpusetRetries = 3;
+            bool cpus_written = false;
+            for (int i = 0; i < kMaxCpusetRetries && !cpus_written; ++i) {
+                usleep(1000 * (i + 1));  // 指数退避：1ms, 2ms, 3ms
+                if (!cpus_path.empty()) {
+                    cpus_written = FileUtils::write_file(cpus_path, cpus_str);
+                }
+            }
+            if (!cpus_written) {
+                LOG_W("CgroupInit", "Failed to set cpus for " + child_path + " after retries");
+                failed++;
+                continue;
+            }
+#else
             if (!FileUtils::write_file(child_path + "/cpus", cpus_str)) {
                 LOG_W("CgroupInit", "Failed to set cpus for " + child_path);
                 failed++;
                 continue;
             }
+#endif
             LOG_D("CgroupInit", "Set " + child_path + "/cpus = " + cpus_str);
             created++;
         }
@@ -145,7 +158,8 @@ private:
                         if (!FileUtils::write_file(uclamp_path, std::to_string(tr.uclamp_max.value()))) {
                             if (first_attempt) {
                                 LOG_W("CgroupInit", "Uclamp write failed, marking unsupported.");
-                                uclamp_supported = false;                                first_attempt = false;
+                                uclamp_supported = false;
+                                first_attempt = false;
                             }
                         }
                     } else {
@@ -165,7 +179,31 @@ private:
     static bool init_schedtune(const Config& config) {
         std::string stune_base = "/dev/stune";
         if (!FileUtils::dir_exists(stune_base)) {
+            LOG_W("CgroupInit", "schedtune base directory not exists: " + stune_base);
             return false;
+        }
+
+        // ✅ P1 改进：权限预检 - 检查是否可写入关键文件
+        std::string test_path = stune_base + "/cpu/cpus";
+        if (!FileUtils::file_exists(test_path)) {
+            LOG_W("CgroupInit", "schedtune test file not exists: " + test_path);
+            return false;
+        }
+        
+        // 尝试写入测试（如果存在 ReUperf 组则跳过）
+        std::string stune_reuperf = stune_base + "/ReUperf";
+        if (!FileUtils::mkdir_recursive(stune_reuperf)) {
+            LOG_W("CgroupInit", "Cannot create ReUperf stune group (permission denied?): " + stune_reuperf);
+            return false;
+        }
+        
+        std::string cpus_file = stune_reuperf + "/cpus";
+        if (FileUtils::file_exists(cpus_file)) {
+            if (!FileUtils::write_file(cpus_file, "0")) {
+                LOG_W("CgroupInit", "Cannot write to stune/cpus (SELinux restrictions?). "
+                      "Schedtune fallback will be disabled.");
+                return false;
+            }
         }
 
         std::string reuperf_stune_path = stune_base + "/ReUperf";
@@ -194,7 +232,7 @@ private:
                 if (FileUtils::file_exists(boost_path) && FileUtils::write_file(boost_path, std::to_string(boost))) {
                     LOG_I("CgroupInit", "Applied schedtune: " + rule.name + " boost=" + std::to_string(boost));
                     any_applied = true;
-                                        if (boost > 50) {
+                    if (boost > 50) {
                         std::string idle_path = path + "/schedtune.prefer_idle";
                         if (FileUtils::file_exists(idle_path)) {
                             FileUtils::write_file(idle_path, "1");

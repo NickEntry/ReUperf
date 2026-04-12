@@ -44,7 +44,8 @@ jobs:
         cmake -B build \
           -DCMAKE_TOOLCHAIN_FILE=${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
           -DANDROID_ABI=${{ matrix.arch }} \
-          -DANDROID_PLATFORM=android-${{ matrix.api_level }} \          -DCMAKE_BUILD_TYPE=Release \
+          -DANDROID_PLATFORM=android-${{ matrix.api_level }} \
+          -DCMAKE_BUILD_TYPE=Release \
           -DANDROID_STL=c++_${{ matrix.build_type == 'static' && 'static' || 'shared' }} \
           -DBUILD_STATIC=${{ matrix.build_type == 'static' && 'ON' || 'OFF' }} \
           -DCMAKE_CXX_STANDARD=17 \

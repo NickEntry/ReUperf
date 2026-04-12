@@ -47,7 +47,8 @@ public:
                 it->second.actual_state == actual_state) {
                 return it->second;
             }
-            it->second.thread_name = thread_name;            it->second.actual_state = actual_state;
+            it->second.thread_name = thread_name;
+            it->second.actual_state = actual_state;
             return it->second;
         }
         return std::nullopt;
@@ -96,7 +97,8 @@ public:
 
     void reset_for_pid(int pid) {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (auto it = cache_.begin(); it != cache_.end(); ) {            if (it->first.first == pid) {
+        for (auto it = cache_.begin(); it != cache_.end(); ) {
+            if (it->first.first == pid) {
                 it = cache_.erase(it);
             } else {
                 ++it;

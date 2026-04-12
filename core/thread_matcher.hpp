@@ -475,6 +475,8 @@ private:
         std::chrono::steady_clock::time_point timestamp;
     };
 
+    // Process cache TTL: 100ms - balances between memory usage and scan frequency
+    // Short TTL ensures responsive to process changes while avoiding excessive scanning
     static constexpr int64_t kProcessCacheTTLMs = 100;
     std::unordered_map<std::string, ProcessCacheEntry> process_cache_;
     mutable std::mutex process_cache_mutex_;

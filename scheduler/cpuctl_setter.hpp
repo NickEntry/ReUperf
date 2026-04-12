@@ -13,6 +13,28 @@ class CpuctlSetter {
 public:
     CpuctlSetter() = default;
 
+    // ✅ P1 改进：添加统计信息
+    struct Stats {
+        int uclamp_success_count = 0;
+        int uclamp_failure_count = 0;
+        int cpuctl_write_count = 0;
+    };
+    
+    const Stats& get_stats() const { return stats_; }
+    
+    void reset_stats() { stats_ = Stats(); }
+    
+    std::string print_stats() const {
+        return "CpuctlSetter Stats: uclamp_success=" + std::to_string(stats_.uclamp_success_count) +
+               ", uclamp_failure=" + std::to_string(stats_.uclamp_failure_count) +
+               ", cpuctl_write=" + std::to_string(stats_.cpuctl_write_count);
+    }
+
+private:
+    mutable Stats stats_;
+    
+public:
+
     bool set_uclamp_max(int tid, int uclamp_max, const std::string& /*cpuctl_base*/,
                         const std::string& rule_name) {
         if (tid <= 0) {
@@ -39,15 +61,19 @@ public:
         
         if (!FileUtils::write_file(path + "/cpu.uclamp.max", std::to_string(uclamp_max))) {
             LOG_W("CpuctlSetter", "Failed to write cpu.uclamp.max for " + path);
+            stats_.uclamp_failure_count++;
             return false;
         }
         
         LOG_T("CpuctlSetter", "Set cpu.uclamp.max=" + std::to_string(uclamp_max) + " for " + path);
+        stats_.uclamp_success_count++;
+        stats_.cpuctl_write_count++;
         
         // 先写入父组 /dev/cpuctl/ReUperf/tasks
         FileUtils::write_cgroup_procs("/dev/cpuctl/ReUperf", tid);
         if (!FileUtils::write_cgroup_procs(path, tid)) {
-            LOG_W("CpuctlSetter", "Failed to move tid " + std::to_string(tid) + " to " + path);            return false;
+            LOG_W("CpuctlSetter", "Failed to move tid " + std::to_string(tid) + " to " + path);
+            return false;
         }
         return true;
     }
@@ -77,6 +103,7 @@ public:
         }
         
         LOG_T("CpuctlSetter", "Set cpu.shares=" + std::to_string(cpu_share) + " for " + path);
+        stats_.cpuctl_write_count++;
         
         FileUtils::write_cgroup_procs("/dev/cpuctl/ReUperf", tid);
         if (!FileUtils::write_cgroup_procs(path, tid)) {
@@ -96,7 +123,7 @@ public:
         }
         
         std::string base = get_cpuctl_base(result.effective_state);
-                // uclamp 写入已内置支持检测，不支持时自动静默跳过
+        // uclamp 写入已内置支持检测，不支持时自动静默跳过
         if (result.uclamp_max.has_value()) {
             if (!set_uclamp_max(tid, result.uclamp_max.value(),
                                 base, result.matched_rule_name)) {

@@ -138,8 +138,10 @@ inline std::string read_file(const std::string& path) {
     return content;
 }
 
-// Android-specific PID range: 1 ~ 32768 (actual limit is task_max, typically 32768)
+// Android-specific PID/TID range limits
+// kMaxPid: Based on Android system's task_max limit (typically 32768)
 static constexpr int kMaxPid = 32768;
+// kMaxTid: Maximum thread ID based on Android kernel configuration
 static constexpr int kMaxTid = 117616;
 
 inline bool is_valid_pid(int pid) {
