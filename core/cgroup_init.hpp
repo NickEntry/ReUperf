@@ -14,19 +14,19 @@
 
 class CgroupInitializer {
 public:
-    // 全局标志：记录内核是否支持 uclamp
+   
     static inline bool uclamp_supported = true;
 
     static bool init(const Config& config) {
         LOG_I("CgroupInit", "Starting cgroup initialization...");
 
-        // 1. Cpuset 是核心功能，必须成功
+        
         if (!init_cpuset(config)) {
             LOG_E("CgroupInit", "Cpuset initialization FAILED. ReUperf cannot start.");
             return false;
         }
 
-        // 2. Cpuctl 初始化（仅用于探测 uclamp 支持情况）
+        
         if (FileUtils::dir_exists("/dev/cpuctl")) {
             init_cpuctl(config);
         } else {
@@ -34,7 +34,7 @@ public:
             uclamp_supported = false;
         }
 
-        // 3. Schedtune 回退（uclamp 不支持时的替代方案）
+        
         if (!uclamp_supported) {
             LOG_W("CgroupInit", "Uclamp NOT supported. Attempting schedtune fallback...");
             if (!init_schedtune(config)) {
