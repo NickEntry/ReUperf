@@ -1,5 +1,6 @@
 #ifndef CGROUP_INIT_HPP
 #define CGROUP_INIT_HPP
+
 #include <string>
 #include <vector>
 #include <map>
@@ -13,7 +14,7 @@
 
 class CgroupInitializer {
 public:
-    // 全局标志：记录内核是否支持 uclamp
+    // ✅ 全局标志：记录内核是否支持 uclamp
     static inline bool uclamp_supported = true;
 
     static bool init(const Config& config) {
@@ -35,19 +36,19 @@ public:
         }
 
         // 3. Schedtune 回退（uclamp 不支持时的替代方案）
-        // 注意：/dev/stune 经常受 SELinux 限制导致不可写。
+        // ⚠️ 注意：ColorOS 上 /dev/stune 通常受 SELinux 限制无法写入。
         // 这里即使 init_schedtune 返回 false，我们也不应该阻断程序启动，
         // 因为 Cpuset + Priority 已经足够工作。
         if (!uclamp_supported) {
             LOG_W("CgroupInit", "Uclamp NOT supported. Attempting schedtune fallback...");
             if (!init_schedtune(config)) {
-                LOG_W("CgroupInit", "Schedtune fallback FAILED. "
-                      "This is normal due to SELinux restrictions on /dev/stune. "
+                LOG_W("CgroupInit", "Schedtune fallback FAILED. This is normal due to SELinux restrictions on /dev/stune. "
                       "Continuing with Cpuset + Priority features.");
+                // ✅ 关键修复：不设置 success = false，允许程序降级启动
             }
         }
-
-        LOG_I("CgroupInit", "Cgroup initialization completed. (Mode: Cpuset + Priority" +               std::string(!uclamp_supported ? " + (Schedtune attempted)" : " + Uclamp") + ")");
+        LOG_I("CgroupInit", "Cgroup initialization completed. (Mode: Cpuset + Priority" + 
+              std::string(!uclamp_supported ? " + (Schedtune attempted)" : " + Uclamp") + ")");
         return true;
     }
 
@@ -95,15 +96,15 @@ private:
                 }
             }
 #ifdef __ANDROID__
-            usleep(10000); // 延迟
-#endif
+            usleep(10000); // 10ms 延迟#endif
+
             if (!FileUtils::write_file(child_path + "/cpus", cpus_str)) {
                 LOG_W("CgroupInit", "Failed to set cpus for " + child_path);
                 failed++; continue;
             }
             created++;
 
-            // ✅ 移除 cpu_exclusive 写入：Android 上通常不支持且一直报 "Invalid argument"，属于无效日志噪音
+            // ✅ 移除 cpu_exclusive 写入：Android 上通常不支持且一直报 "Invalid argument"
         }
         LOG_I("CgroupInit", "cpuset cgroups: " + std::to_string(created) + " created, " + std::to_string(failed) + " failed");
         return true;
@@ -144,17 +145,16 @@ private:
             }
         }
         LOG_I("CgroupInit", "cpuctl init done (Uclamp: " + std::string(uclamp_supported ? "Yes" : "No") + ")");
-        return true;
-    }
+        return true;    }
+
     static bool init_schedtune(const Config& config) {
         std::string stune_base = "/dev/stune";
         if (!FileUtils::dir_exists(stune_base)) return false;
 
         std::string reuperf_stune_path = stune_base + "/ReUperf";
-        // 尝试创建 ReUperf 根目录
+        // ✅ 尝试创建根目录，如果失败直接返回 false（ColorOS 常见）
         if (!FileUtils::mkdir_recursive(reuperf_stune_path)) {
-            LOG_E("CgroupInit", "Failed to create schedtune base: " + reuperf_stune_path + 
-                  ". SELinux likely blocking writes to /dev/stune.");
+            LOG_W("CgroupInit", "Failed to create schedtune base: " + reuperf_stune_path);
             return false;
         }
 
@@ -162,9 +162,7 @@ private:
         for (const auto& rule : config.sched.rules) {
             std::string path = reuperf_stune_path + "/" + rule.name;
             if (!FileUtils::mkdir_recursive(path)) {
-                // 单个组创建失败不阻断，仅警告
-                LOG_W("CgroupInit", "Failed to create schedtune group: " + path);
-                continue;
+                continue; // 单个组失败不阻断
             }
 
             int max_uclamp = -1;
@@ -174,7 +172,7 @@ private:
                 }
             }
 
-            if (max_uclamp >= 0) {
+           if (max_uclamp >= 0) {
                 int boost = (max_uclamp * 100) / 1024;
                 std::string boost_path = path + "/schedtune.boost";
                 
