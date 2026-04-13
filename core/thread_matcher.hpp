@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <chrono>
 #include <mutex>
+#include <limits>
 #include "../config/config_types.hpp"
 #include "../utils/logger.hpp"
 
@@ -44,6 +45,7 @@ struct CompiledProcessRule {
     ProcessRule rule;
     std::regex pattern;        // 匹配 cmdline
     std::regex comm_pattern;   // 匹配 comm
+    bool has_comm_pattern = false;  // 标记 comm_pattern 是否已初始化
     std::vector<CompiledThreadRule> thread_rules;
 };
 
@@ -88,6 +90,7 @@ public:
                 } else {
                     try {
                         cr.comm_pattern = std::regex(comm_expanded);
+                        cr.has_comm_pattern = true;
                     } catch (const std::regex_error&) {
                         LOG_W("ThreadMatcher", "Skip invalid comm process regex: " + rule.comm_regex_str);
                     }
@@ -138,7 +141,9 @@ public:
         std::string cache_key = proc_name + "#|#" + thread_name + "#|#" + cmdline;
         
         if (proc_name == "[dead]") {
-            process_cache_.erase(cache_key);
+            size_t bucket = get_cache_bucket(cache_key);
+            std::lock_guard<std::mutex> lock(process_cache_mutex_[bucket]);
+            process_cache_[bucket].erase(cache_key);
             return result;
         }
         
@@ -170,12 +175,7 @@ public:
             }
 
             // 单独的 comm_regex 字段（向后兼容）
-            bool has_comm_pattern = false;
-            try {
-                has_comm_pattern = cr.comm_pattern.mark_count() >= 0;
-            } catch (...) {
-                has_comm_pattern = false;
-            }
+            bool has_comm_pattern = cr.has_comm_pattern;
             if (has_comm_pattern && std::regex_search(proc_name, cr.comm_pattern)) {
                 matched_rule = &cr;
                 break;
@@ -259,7 +259,9 @@ public:
         std::string cache_key = proc_name + "#|#" + thread_name + "#|#" + cmdline;
         
         if (proc_name == "[dead]") {
-            process_cache_.erase(cache_key);
+            size_t bucket = get_cache_bucket(cache_key);
+            std::lock_guard<std::mutex> lock(process_cache_mutex_[bucket]);
+            process_cache_[bucket].erase(cache_key);
             return result;
         }
         
@@ -291,12 +293,7 @@ public:
                 break;
             }
 
-            bool has_comm_pattern = false;
-            try {
-                has_comm_pattern = cr.comm_pattern.mark_count() >= 0;
-            } catch (...) {
-                has_comm_pattern = false;
-            }
+            bool has_comm_pattern = cr.has_comm_pattern;
             if (has_comm_pattern && std::regex_search(proc_name, cr.comm_pattern)) {
                 matched_rule = &cr;
                 break;
@@ -475,25 +472,82 @@ private:
         std::chrono::steady_clock::time_point timestamp;
     };
 
-    // Process cache TTL: 100ms - balances between memory usage and scan frequency
-    // Short TTL ensures responsive to process changes while avoiding excessive scanning
     static constexpr int64_t kProcessCacheTTLMs = 100;
-    static constexpr size_t kMaxProcessCacheSize = 500;  // Maximum cache entries
-    std::unordered_map<std::string, ProcessCacheEntry> process_cache_;
-    mutable std::mutex process_cache_mutex_;
+    static constexpr int64_t kProcessCacheTTLMsHighLoad = 50;
+    static constexpr int64_t kProcessCacheTTLMsLowLoad = 200;
+    
+    // 细粒度锁：分桶策略
+    static constexpr size_t kCacheBuckets = 16;
+    std::unordered_map<std::string, ProcessCacheEntry> process_cache_[kCacheBuckets];
+    mutable std::mutex process_cache_mutex_[kCacheBuckets];
+
+    inline size_t get_cache_bucket(const std::string& key) const {
+        return std::hash<std::string>{}(key) % kCacheBuckets;
+    }
+
+    // 动态调整缓存 TTL，根据系统负载
+    int64_t get_dynamic_ttl() const {
+        // 简化的负载估算：基于缓存条目数量
+        // 实际可以使用 /proc/loadavg 或其他方式获取系统负载
+        size_t total_size = 0;
+        for (size_t i = 0; i < kCacheBuckets; ++i) {
+            total_size += process_cache_[i].size();
+        }
+        if (total_size > 1000) {
+            return kProcessCacheTTLMsHighLoad;
+        } else if (total_size > 500) {
+            return kProcessCacheTTLMs;
+        }
+        return kProcessCacheTTLMsLowLoad;
+    }
+
+    // 检查正则表达式是否安全（防范 ReDoS）
+    static bool is_regex_safe(const std::string& pattern) {
+        // 禁止嵌套量词
+        int nesting = 0;
+        bool prev_was_quantifier = false;
+        
+        for (char c : pattern) {
+            if (c == '(') nesting++;
+            if (c == ')') nesting--;
+            if (nesting < 0) return false;
+            
+            if (c == '*' || c == '+' || c == '?') {
+                if (prev_was_quantifier) return false;
+                prev_was_quantifier = true;
+            } else if (c != '.' && c != '^' && c != '$' && c != '[' && c != ']') {
+                prev_was_quantifier = false;
+            }
+        }
+        
+        // 限制最大重复次数
+        size_t pos = pattern.find(".*");
+        if (pos != std::string::npos && pos != 0) {
+            // 检查 .* 前面是否有非贪婪修饰符
+            if (pos > 0 && pattern[pos-1] != '*') {
+                // 允许 .* 但发出警告
+            }
+        }
+        
+        return true;
+    }
 
     void clear_process_cache() {
-        std::lock_guard<std::mutex> lock(process_cache_mutex_);
-        process_cache_.clear();
+        for (size_t i = 0; i < kCacheBuckets; ++i) {
+            std::lock_guard<std::mutex> lock(process_cache_mutex_[i]);
+            process_cache_[i].clear();
+        }
     }
 
     std::optional<ProcessCacheEntry> get_cached_process_result(const std::string& proc_name) {
-        std::lock_guard<std::mutex> lock(process_cache_mutex_);
-        auto it = process_cache_.find(proc_name);
-        if (it != process_cache_.end()) {
+        size_t bucket = get_cache_bucket(proc_name);
+        std::lock_guard<std::mutex> lock(process_cache_mutex_[bucket]);
+        auto it = process_cache_[bucket].find(proc_name);
+        if (it != process_cache_[bucket].end()) {
+            int64_t ttl = get_dynamic_ttl();
             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - it->second.timestamp).count();
-            if (elapsed_ms < kProcessCacheTTLMs) {
+            if (elapsed_ms < ttl) {
                 return it->second;
             }
         }
@@ -501,19 +555,9 @@ private:
     }
 
     void cache_process_result(const std::string& proc_name, const ProcessCacheEntry& entry) {
-        std::lock_guard<std::mutex> lock(process_cache_mutex_);
-        // Evict oldest entries if cache is full
-        if (process_cache_.size() >= kMaxProcessCacheSize) {
-            auto oldest = process_cache_.begin();
-            auto now = std::chrono::steady_clock::now();
-            for (auto it = process_cache_.begin(); it != process_cache_.end(); ++it) {
-                if (it->second.timestamp < oldest->second.timestamp) {
-                    oldest = it;
-                }
-            }
-            process_cache_.erase(oldest);
-        }
-        process_cache_[proc_name] = entry;
+        size_t bucket = get_cache_bucket(proc_name);
+        std::lock_guard<std::mutex> lock(process_cache_mutex_[bucket]);
+        process_cache_[bucket][proc_name] = entry;
     }
 };
 

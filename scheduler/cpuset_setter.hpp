@@ -5,6 +5,8 @@
 #include <vector>
 #include <set>
 #include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <fcntl.h>
 #include "../config/config_types.hpp"
 #include "../utils/file_utils.hpp"
@@ -79,21 +81,37 @@ public:
         
         if (!checked_groups_.count(path)) {
             checked_groups_.insert(path);
-            std::string cpus_val = FileUtils::read_file(path + "/cpus");
-            if (cpus_val.empty()) {
+            
+            // 缓存 cpus 文件内容，避免重复读取
+            if (cpus_cache_.find(path) == cpus_cache_.end()) {
+                std::string cpus_val = FileUtils::read_file(path + "/cpus");
+                cpus_cache_[path] = cpus_val;
+            }
+            
+            if (cpus_cache_[path].empty()) {
                 LOG_W("CpusetSetter", path + "/cpus is empty, skipping all moves to this group");
                 skip_groups_.insert(path);
                 return false;
             }
         }
         
-        if (!FileUtils::write_file(path + "/cgroup.procs", std::to_string(tid))) {
-            LOG_W("CpusetSetter", "Failed to move tid " + std::to_string(tid) + " to " + path);
-            return false;
+        // 增加重试机制
+        constexpr int kMaxRetries = 3;
+        constexpr int kRetryIntervalMs = 10;
+        
+        for (int retry = 0; retry < kMaxRetries; ++retry) {
+            if (FileUtils::write_file(path + "/cgroup.procs", std::to_string(tid))) {
+                LOG_T("CpusetSetter", "Moved tid " + std::to_string(tid) + " to cpuset " + path);
+                return true;
+            }
+            
+            if (retry < kMaxRetries - 1) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(kRetryIntervalMs));
+            }
         }
         
-        LOG_T("CpusetSetter", "Moved tid " + std::to_string(tid) + " to cpuset " + path);
-        return true;
+        LOG_W("CpusetSetter", "Failed to move tid " + std::to_string(tid) + " to " + path + " after " + std::to_string(kMaxRetries) + " retries");
+        return false;
     }
     
     bool apply_with_result(int /*pid*/, int tid, const MatchResult& result,
@@ -130,6 +148,7 @@ private:
     mutable std::mutex mutex_;
     std::set<std::string> checked_groups_;  // 已检查过 cpus 的组
     std::set<std::string> skip_groups_;     // cpus 为空需跳过的组
+    std::unordered_map<std::string, std::string> cpus_cache_;  // 缓存 cpus 文件内容
     
     // 静默写入 cgroup.procs（不记日志，用于非关键的父组先行写入）
     static bool write_cgroup_procs_silent(const std::string& path, int tid) {

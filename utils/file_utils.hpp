@@ -82,39 +82,31 @@ inline bool write_file(const std::string& path, const std::string& content) {
     return true;
 }
 
-// Singleton pattern for cache to avoid ODR issues in header-only design
+namespace {
     struct FileCacheEntry {
         std::string content;
         std::chrono::steady_clock::time_point timestamp;
     };
-
-    struct FileCache {
-        std::unordered_map<std::string, FileCacheEntry> cache;
-        std::mutex mutex;
-        std::unordered_map<std::string, std::list<std::string>::iterator> order;
-        std::list<std::string> lru;
-        static constexpr int kTTLMs = 100;
-        static constexpr size_t kMaxSize = 1000;
-    };
-
-    inline FileCache& get_file_cache() {
-        static FileCache instance;
-        return instance;
-    }
+    std::unordered_map<std::string, FileCacheEntry> file_cache;
+    std::mutex file_cache_mutex;
+    std::unordered_map<std::string, std::list<std::string>::iterator> file_cache_order;
+    std::list<std::string> file_cache_lru;
+    static constexpr int kFileCacheTTLMs = 100;
+    static constexpr size_t kMaxCacheSize = 1000;
+}
 
 inline std::string read_file(const std::string& path) {
     auto now = std::chrono::steady_clock::now();
-    auto& fc = get_file_cache();
     {
-        std::lock_guard<std::mutex> lock(fc.mutex);
-        auto it = fc.cache.find(path);
-        if (it != fc.cache.end() && std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - it->second.timestamp).count() < FileCache::kTTLMs) {
-            auto lru_it = fc.order.find(path);
-            if (lru_it != fc.order.end()) {
-                fc.lru.erase(lru_it->second);
-                fc.lru.push_back(path);
-                fc.order[path] = --fc.lru.end();
+        std::lock_guard<std::mutex> lock(file_cache_mutex);
+        auto it = file_cache.find(path);
+        if (it != file_cache.end() && std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - it->second.timestamp).count() < kFileCacheTTLMs) {
+            auto lru_it = file_cache_order.find(path);
+            if (lru_it != file_cache_order.end()) {
+                file_cache_lru.erase(lru_it->second);
+                file_cache_lru.push_back(path);
+                file_cache_order[path] = --file_cache_lru.end();
             }
             return it->second.content;
         }
@@ -132,24 +124,22 @@ inline std::string read_file(const std::string& path) {
     }
     
     {
-        std::lock_guard<std::mutex> lock(fc.mutex);
-        if (fc.cache.size() >= FileCache::kMaxSize && !fc.lru.empty()) {
-            auto oldest = fc.lru.front();
-            fc.lru.pop_front();
-            fc.cache.erase(oldest);
-            fc.order.erase(oldest);
+        std::lock_guard<std::mutex> lock(file_cache_mutex);
+        if (file_cache.size() >= kMaxCacheSize && !file_cache_lru.empty()) {
+            auto oldest = file_cache_lru.front();
+            file_cache_lru.pop_front();
+            file_cache.erase(oldest);
+            file_cache_order.erase(oldest);
         }
-        fc.cache[path] = {content, now};
-        fc.lru.push_back(path);
-        fc.order[path] = --fc.lru.end();
+        file_cache[path] = {content, now};
+        file_cache_lru.push_back(path);
+        file_cache_order[path] = --file_cache_lru.end();
     }
     return content;
 }
 
-// Android-specific PID/TID range limits
-// kMaxPid: Based on Android system's task_max limit (typically 32768)
+// Android-specific PID range: 1 ~ 32768 (actual limit is task_max, typically 32768)
 static constexpr int kMaxPid = 32768;
-// kMaxTid: Maximum thread ID based on Android kernel configuration
 static constexpr int kMaxTid = 117616;
 
 inline bool is_valid_pid(int pid) {
@@ -458,6 +448,68 @@ inline std::vector<int> read_cgroup_procs(const std::string& path) {
 
 inline bool write_cgroup_procs(const std::string& path, int tid) {
     return write_file(path + "/cgroup.procs", std::to_string(tid));
+}
+
+// 进程信息缓存
+struct ProcInfoCache {
+    std::string name;
+    std::string cmdline;
+    std::chrono::steady_clock::time_point timestamp;
+};
+
+static constexpr int64_t kProcInfoCacheTTLMs = 500;
+static constexpr size_t kMaxProcInfoCacheSize = 500;
+
+inline std::unordered_map<int, ProcInfoCache>& get_proc_info_cache() {
+    static std::unordered_map<int, ProcInfoCache> cache;
+    return cache;
+}
+
+inline std::mutex& get_proc_info_cache_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+// 获取进程信息（带缓存）
+inline std::pair<std::string, std::string> get_process_info_cached(int pid) {
+    std::lock_guard<std::mutex> lock(get_proc_info_cache_mutex());
+    auto& cache = get_proc_info_cache();
+    auto now = std::chrono::steady_clock::now();
+    
+    auto it = cache.find(pid);
+    if (it != cache.end()) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.timestamp).count();
+        if (elapsed < kProcInfoCacheTTLMs) {
+            return {it->second.name, it->second.cmdline};
+        }
+    }
+    
+    // 缓存未命中，读取文件
+    std::string name = get_process_name_from_status(pid);
+    std::string cmdline = get_process_cmdline(pid);
+    
+    // 限制缓存大小
+    if (cache.size() >= kMaxProcInfoCacheSize) {
+        // 清理过期的缓存项
+        for (auto iter = cache.begin(); iter != cache.end();) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - iter->second.timestamp).count();
+            if (elapsed >= kProcInfoCacheTTLMs) {
+                iter = cache.erase(iter);
+            } else {
+                ++iter;
+            }
+        }
+        // 如果仍然满了，随机删除一些
+        if (cache.size() >= kMaxProcInfoCacheSize) {
+            size_t to_remove = cache.size() - kMaxProcInfoCacheSize / 2;
+            for (size_t i = 0; i < to_remove && !cache.empty(); ++i) {
+                cache.erase(cache.begin());
+            }
+        }
+    }
+    
+    cache[pid] = {name, cmdline, now};
+    return {name, cmdline};
 }
 
 }

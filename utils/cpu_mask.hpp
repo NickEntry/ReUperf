@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <sched.h>
 #include <cstring>
-#include <cerrno>
 #include <dirent.h>
 #include <cctype>
 #include "logger.hpp"
@@ -119,27 +118,15 @@ public:
                     size_t end_pos = (comma_pos == std::string::npos) ? value.size() : comma_pos;
                     
                     if (dash_pos != std::string::npos && dash_pos > i && dash_pos < end_pos) {
-                        try {
-                            int start_cpu = std::stoi(value.substr(i, dash_pos - i));
-                            int end_cpu = std::stoi(value.substr(dash_pos + 1, end_pos - dash_pos - 1));
-                            if (start_cpu >= 0 && end_cpu >= start_cpu && end_cpu < CPU_SETSIZE) {
-                                for (int cpu = start_cpu; cpu <= end_cpu; cpu++) {
-                                    cpus.push_back(cpu);
-                                }
-                            }
-                        } catch (const std::exception& e) {
-                            LOG_W("CpuMask", "Invalid CPU range in Cpus_allowed_list");
+                        int start_cpu = std::stoi(value.substr(i, dash_pos - i));
+                        int end_cpu = std::stoi(value.substr(dash_pos + 1, end_pos - dash_pos - 1));
+                        for (int cpu = start_cpu; cpu <= end_cpu; cpu++) {
+                            cpus.push_back(cpu);
                         }
                         i = end_pos;
                     } else {
-                        try {
-                            int cpu = std::stoi(value.substr(i, end_pos - i));
-                            if (cpu >= 0 && cpu < CPU_SETSIZE) {
-                                cpus.push_back(cpu);
-                            }
-                        } catch (const std::exception& e) {
-                            LOG_W("CpuMask", "Invalid CPU value in Cpus_allowed_list");
-                        }
+                        int cpu = std::stoi(value.substr(i, end_pos - i));
+                        cpus.push_back(cpu);
                         i = end_pos;
                     }
                     
@@ -202,13 +189,10 @@ public:
             }
             if (!all_digits) continue;
 
-            errno = 0;
-            char* end_ptr = nullptr;
-            long cpu_num = strtol(name + 3, &end_ptr, 10);
-            if (errno != 0 || end_ptr == name + 3 || cpu_num < 0 || cpu_num >= CPU_SETSIZE) {
-                continue;
+            int cpu_num = atoi(name + 3);
+            if (cpu_num >= 0) {
+                cpus.push_back(cpu_num);
             }
-            cpus.push_back(static_cast<int>(cpu_num));
         }
         closedir(dir);
 

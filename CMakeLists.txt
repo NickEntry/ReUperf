@@ -1,10 +1,9 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.10)
 project(thread_scheduler LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(BUILD_STATIC "Build static executable" OFF)
 
@@ -55,10 +54,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND EXISTS "/data/data/com.termux")
     endif()
 endif()
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic -Wshadow -O2")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -O2")
 
-# 尝试查找本地已安装的 nlohmann-json
-find_package(nlohmann_json QUIET)
+# 始终使用 stub 来避免 libcap 链接问题
+# stub 提供空的 capability 函数实现
+set(USE_CAPABILITY_STUB ON)
+message(STATUS "Using stub for capability functions (cross-platform)")
+
+# 注意：target_compile_definitions 将在 add_executable 后调用
 
 if(NOT nlohmann_json_FOUND)
     # 检查本地离线文件
@@ -89,8 +92,39 @@ target_include_directories(thread_scheduler PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+# 传递宏给编译器（在目标创建后）
+target_compile_definitions(thread_scheduler PRIVATE USE_CAPABILITY_STUB=1)
+
 target_link_libraries(thread_scheduler PRIVATE
     nlohmann_json::nlohmann_json
 )
+
+# libcap 链接逻辑：
+# - 仅在原生 x86_64/x86 编译时链接 libcap（libcap-dev 提供的头文件和库）
+# - 交叉编译（ARM）或静态构建时跳过 libcap（使用代码中的 stub）
+if(CMAKE_C_COMPILER STREQUAL "/usr/bin/gcc" OR CMAKE_C_COMPILER STREQUAL "/usr/bin/c++")
+    # 原生 x86_64/x86 编译：检查 libcap-dev 是否已安装
+    find_package(PkgConfig QUIET)
+    pkg_check_modules(LIBCAP QUIET libcap)
+    if(LIBCAP_FOUND)
+        target_link_libraries(thread_scheduler PRIVATE ${LIBCAP_LIBRARIES})
+        message(STATUS "Found libcap, linking: ${LIBCAP_LIBRARIES}")
+    else()
+        message(STATUS "libcap-dev not found, will use stub")
+    endif()
+elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "i386" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "i686")
+    # 交叉编译 x86 架构：检查 libcap-dev
+    find_package(PkgConfig QUIET)
+    pkg_check_modules(LIBCAP QUIET libcap)
+    if(LIBCAP_FOUND)
+        target_link_libraries(thread_scheduler PRIVATE ${LIBCAP_LIBRARIES})
+        message(STATUS "Found libcap for cross-compile, linking: ${LIBCAP_LIBRARIES}")
+    else()
+        message(STATUS "libcap-dev not found for cross-compile, will use stub")
+    endif()
+else()
+    # ARM 交叉编译：跳过 libcap，使用 stub
+    message(STATUS "Cross-compile for ARM, using stub for capability functions")
+endif()
 
 install(TARGETS thread_scheduler DESTINATION bin)

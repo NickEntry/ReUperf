@@ -132,30 +132,22 @@ private:
                     
                     if (event->mask & IN_CREATE) {
                         if (name.find_first_not_of("0123456789") == std::string::npos) {
-                            try {
-                                int pid = std::stoi(name);
-                                if (pid > 0) {
-                                    LOG_D("ProcMonitor", "Process created: " + name);
-                                    if (on_process_change_) {
-                                        on_process_change_(pid);
-                                    }
+                            int pid = std::stoi(name);
+                            if (pid > 0) {
+                                LOG_D("ProcMonitor", "Process created: " + name);
+                                if (on_process_change_) {
+                                    on_process_change_(pid);
                                 }
-                            } catch (const std::exception& e) {
-                                LOG_W("ProcMonitor", "Invalid PID format in CREATE event: " + name);
                             }
                         }
                     } else if (event->mask & IN_DELETE) {
                         if (name.find_first_not_of("0123456789") == std::string::npos) {
-                            try {
-                                int pid = std::stoi(name);
-                                if (pid > 0) {
-                                    LOG_D("ProcMonitor", "Process deleted: " + name);
-                                    if (on_process_change_) {
-                                        on_process_change_(-pid);
-                                    }
+                            int pid = std::stoi(name);
+                            if (pid > 0) {
+                                LOG_D("ProcMonitor", "Process deleted: " + name);
+                                if (on_process_change_) {
+                                    on_process_change_(-pid);
                                 }
-                            } catch (const std::exception& e) {
-                                LOG_W("ProcMonitor", "Invalid PID format in DELETE event: " + name);
                             }
                         }
                     }
