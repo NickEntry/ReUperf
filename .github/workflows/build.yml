@@ -42,7 +42,6 @@ jobs:
         sudo apt-get install -y cmake build-essential nlohmann-json3-dev lld
     - name: Configure CMake
       run: |
-        echo "🔧 Configuring CMake for ${{ matrix.arch }} (${{ matrix.build_type }})..."
         cmake -B build \
           -DCMAKE_TOOLCHAIN_FILE=${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
           -DANDROID_ABI=${{ matrix.arch }} \
@@ -57,62 +56,18 @@ jobs:
           -DCMAKE_EXE_LINKER_FLAGS="-Wl,--gc-sections" \
           -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
           -S .
-        echo "✅ CMake configuration completed"
-        echo "📋 CMake Cache Summary:"
-        grep -E "(CMAKE_CXX_COMPILER|CMAKE_SYSTEM_PROCESSOR|ANDROID_ABI)" build/CMakeCache.txt || true
     - name: Build Project
-      run: |
-        echo "🔨 Building for ${{ matrix.arch }} (${{ matrix.build_type }})..."
-        cmake --build build --config Release --parallel $(nproc) 2>&1 | tee build.log || {
-          echo "❌ BUILD FAILED!"
-          echo ""
-          echo "📋 ===== Build Log Summary ====="
-          echo ""
-          echo "🔴 Errors found in build.log:"
-          grep -i "error:" build.log | head -20 || echo "No 'error:' pattern found"
-          echo ""
-          echo "⚠️  Warnings found in build.log:"
-          grep -i "warning:" build.log | head -10 || echo "No 'warning:' pattern found"
-          echo ""
-          echo "📄 Last 50 lines of build output:"
-          tail -50 build.log
-          echo ""
-          echo "📁 Build directory contents:"
-          ls -lh build/ || true
-          exit 1
-        }
-        echo "✅ Build completed successfully"
+      run: cmake --build build --config Release --parallel $(nproc)
 
-    - name: Upload Build Log (on failure)
-      if: failure()
-      uses: actions/upload-artifact@v5
-      with:
-        name: build-log-${{ matrix.arch }}-${{ matrix.build_type }}
-        path: build.log
-        retention-days: 7
-        
     - name: Verify Binary
       run: |
-        echo "🔍 Verifying build output..."
         BINARY="build/thread_scheduler"
         if [ ! -f "$BINARY" ]; then
           echo "❌ ERROR: Binary not found at $BINARY"
-          echo ""
-          echo "📁 Build directory contents:"
-          ls -lh build/ || true
           exit 1
         fi
-        echo "✅ Binary found: $BINARY"
-        echo ""
-        echo "📦 File information:"
+        echo "📦 File info:"
         file "$BINARY"
-        echo ""
-        echo "📊 Binary size:"
-        ls -lh "$BINARY"
-        echo ""
-        echo "🔧 Binary dependencies:"
-        ldd "$BINARY" || echo "(ldd not available for Android binary)"
-        echo ""
         echo "✅ Binary validation passed"
     # ✅ [更新] upload-artifact@v5（注意：v5 默认不合并多个 artifact）
     - name: Upload Artifact
