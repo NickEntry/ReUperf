@@ -10,6 +10,11 @@
 class CpuctlSetter {
 public:
     CpuctlSetter() = default;
+
+    // Returns the base cpuctl path (kept for ThreadCache compatibility)
+    std::string get_cpuctl_base(ProcessState /*state*/) {
+        return "/dev/cpuctl";
+    }
     
     bool apply_with_result(int /*pid*/, int tid, const MatchResult& result) {
         if (!result.matched || !result.enable_limit) {
