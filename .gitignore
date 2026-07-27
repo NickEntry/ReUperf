@@ -1,10 +1,17 @@
 # Build output
 build/
+build_static/
 *.o
 *.a
 *.so
 *.dylib
 *.exe
+
+# CMake artifacts (in source root)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
 
 # IDE
 .vscode/

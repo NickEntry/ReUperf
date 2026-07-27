@@ -85,17 +85,17 @@ make
 
 **cpuset** (for CPU affinity):
 ```
-/dev/cpuset/ReUperf/{cpumask_name}
+/dev/cpuset/ReUperf_{cpumask_name}
 ```
 
 **cpuctl** (for resource limits):
 ```
-/dev/cpuctl/ReUperf/{rule_name}
+/dev/cpuctl/ReUperf/{rule_name}/A{index}
 ```
 
 **Note**: When moving threads to cgroup, tasks are first written to the parent group:
-- cpuset: `/dev/cpuset/ReUperf/tasks` → `/dev/cpuset/ReUperf/{cpumask}/tasks`
-- cpuctl: `/dev/cpuctl/ReUperf/tasks` → `/dev/cpuctl/ReUperf/{rule_name}/tasks`
+- cpuset: `/dev/cpuset/ReUperf_{cpumask}/tasks` → `/dev/cpuset/ReUperf_{cpumask}/tasks`
+- cpuctl: `/dev/cpuctl/ReUperf/tasks` → `/dev/cpuctl/ReUperf/{rule_name}/A{index}/tasks`
 
 ## Main Loop
 

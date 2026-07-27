@@ -155,7 +155,7 @@
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `name` | string | 必填 | 规则名称（用于 cpuctl 路径：`/dev/cpuctl/ReUperf/{name}`） |
+| `name` | string | 必填 | 规则名称（用于 cpuctl 路径：`/dev/cpuctl/ReUperf/{name}/A{index}`） |
 | `regex` | string | "." | 进程名正则表达式 |
 | `pinned` | bool | false | 始终视为 TOP 状态 |
 | `topfore` | bool | false | 在前台时视为 TOP 状态 |

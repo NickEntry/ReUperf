@@ -181,7 +181,7 @@ private:
         return ts.str();
     }
 
-    std::atomic<LogLevel> level_; 
+    LogLevel level_; 
     std::string log_file_; 
     bool console_output_; 
     bool structured_logging_; 

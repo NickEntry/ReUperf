@@ -147,38 +147,48 @@ private:
             return false;
         }
         
-        // 创建各规则子组
+        // 创建各规则子组，以及每个线程规则的 A{index} 子组
         for (const auto& rule : config.sched.rules) {
-            std::string path = reuperf_path + "/" + rule.name;
+            std::string rule_path = reuperf_path + "/" + rule.name;
             
-            if (!FileUtils::mkdir_recursive(path)) {
-                LOG_W("CgroupInit", "Failed to create cpuctl: " + path);
+            if (!FileUtils::mkdir_recursive(rule_path)) {
+                LOG_W("CgroupInit", "Failed to create cpuctl: " + rule_path);
                 continue;
             }
             
-            LOG_D("CgroupInit", "Created cpuctl group: " + path);
-            
-            for (const auto& tr : rule.thread_rules) {
-                if (tr.enable_limit) {
-                    if (tr.uclamp_max.has_value()) {
-                        std::string uclamp_path = path + "/cpu.uclamp.max";
-                        if (FileUtils::file_exists(uclamp_path)) {
-                            FileUtils::write_file(uclamp_path, 
-                                std::to_string(tr.uclamp_max.value()));
-                        } else {
-                            LOG_W("CgroupInit", uclamp_path + " not found, skipping");
-                        }
-                    }
-                    if (tr.cpu_share.has_value()) {
-                        std::string shares_path = path + "/cpu.shares";
-                        if (FileUtils::file_exists(shares_path)) {
-                            FileUtils::write_file(shares_path, 
-                                std::to_string(tr.cpu_share.value()));
-                        } else {
-                            LOG_W("CgroupInit", shares_path + " not found, skipping");
-                        }
+            LOG_D("CgroupInit", "Created cpuctl group: " + rule_path);
+
+            // Create A{index} subdirectories for each thread rule with enable_limit
+            for (size_t i = 0; i < rule.thread_rules.size(); ++i) {
+                const auto& tr = rule.thread_rules[i];
+                if (!tr.enable_limit) continue;
+
+                std::string sub_path = rule_path + "/A" + std::to_string(i + 1);
+                if (!FileUtils::mkdir_recursive(sub_path)) {
+                    LOG_W("CgroupInit", "Failed to create cpuctl: " + sub_path);
+                    continue;
+                }
+
+                if (tr.uclamp_max.has_value()) {
+                    std::string uclamp_path = sub_path + "/cpu.uclamp.max";
+                    if (FileUtils::file_exists(uclamp_path)) {
+                        FileUtils::write_file(uclamp_path,
+                            std::to_string(tr.uclamp_max.value()));
+                    } else {
+                        LOG_W("CgroupInit", uclamp_path + " not found, skipping");
                     }
                 }
+                if (tr.cpu_share.has_value()) {
+                    std::string shares_path = sub_path + "/cpu.shares";
+                    if (FileUtils::file_exists(shares_path)) {
+                        FileUtils::write_file(shares_path,
+                            std::to_string(tr.cpu_share.value()));
+                    } else {
+                        LOG_W("CgroupInit", shares_path + " not found, skipping");
+                    }
+                }
+
+                LOG_D("CgroupInit", "Created cpuctl sub-group: " + sub_path);
             }
         }
         

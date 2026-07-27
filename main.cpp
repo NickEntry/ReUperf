@@ -96,6 +96,10 @@ uint64_t compute_config_hash(const std::string& path) {
 
 class ConfigFileWatcher {
 public:
+    // Design: config change detection has a one-cycle delay by design.
+    // The inotify event sets an internal flag; the flag is consumed on the
+    // next call to check_and_clear(). This avoids partial-write race conditions
+    // where the config file is being written while we try to read it.
     explicit ConfigFileWatcher(const std::string& config_path)
         : config_path_(config_path), inotify_fd_(-1), watch_fd_(-1), config_changed_(false) {}
 
@@ -179,7 +183,6 @@ private:
     std::atomic<bool> config_changed_;
 };
 
-template<typename T>
 class PidCache {
 public:
     void update(const std::set<int>& pids) {
@@ -212,8 +215,8 @@ private:
     std::set<int> pids_;
 };
 
-using PinnedCache = PidCache<void>;
-using TopForeCache = PidCache<void>;
+using PinnedCache = PidCache;
+using TopForeCache = PidCache;
 
 void scan_and_update_rule_cache(ThreadMatcher& matcher,
                                 std::set<int>& pinned_pids,
@@ -322,11 +325,7 @@ inline void dispatch_fg_top_to_workers(std::vector<std::unique_ptr<ScanWorker>>&
     for (const auto& info : processes) {
         int worker_idx = info.pid % workers.size();
         
-        std::string cmdline = FileUtils::read_file("/proc/" + std::to_string(info.pid) + "/cmdline");
-        if (!cmdline.empty()) {
-            size_t pos = cmdline.find('\0');
-            if (pos != std::string::npos) cmdline = cmdline.substr(0, pos);
-        }
+        std::string cmdline = FileUtils::get_process_cmdline(info.pid);
 
         for (int tid : info.tids) {
             if (processed_tids.count(tid) > 0) continue;
@@ -362,12 +361,12 @@ void cleanup_dead_pids(ThreadCache& cache, PinnedCache& pinned_cache,
     }
 }
 
-int main(int /*argc*/, char* argv[]) {
+int main(int argc, char* argv[]) {
     // Whitelist config path - only allow files under /data/adb/ReUperf/
     std::string config_path = "/data/adb/ReUperf/ReUperf.json";
     std::string allowed_dir = "/data/adb/ReUperf";
     
-    if (argv[1] != nullptr) {
+    if (argc > 1 && argv[1] != nullptr) {
         std::string user_path = argv[1];
         
         // Security: validate path is within allowed directory
@@ -502,8 +501,27 @@ int main(int /*argc*/, char* argv[]) {
                 LOG_I("Main", "Incremental dispatch for new pid: " + std::to_string(pid));
                 std::set<int> single_pid = {pid};
                 std::set<int> processed;
-                dispatch_pinned_to_workers(workers, single_pid, processed);
-                dispatch_topfore_to_workers(workers, single_pid, processed);
+
+                // Quick check: determine which category this new PID belongs to
+                std::string proc_name = FileUtils::get_process_name_from_status(pid);
+                if (proc_name == "[dead]") continue;
+                std::string cmdline = FileUtils::get_process_cmdline(pid);
+                FileUtils::CgroupState cg_state = FileUtils::get_cgroup_state(pid);
+                ProcessState actual_state = ProcessState::BG;
+                if (cg_state == FileUtils::CgroupState::TOP) {
+                    actual_state = ProcessState::TOP;
+                } else if (cg_state == FileUtils::CgroupState::FG) {
+                    actual_state = ProcessState::FG;
+                }
+                MatchResult result = matcher_ptr->match_process_only(proc_name, proc_name, actual_state, pid, cmdline);
+
+                if (result.matched && result.matched_rule_name != "Default rule") {
+                    if (result.pinned) {
+                        dispatch_pinned_to_workers(workers, single_pid, processed);
+                    } else if (result.topfore) {
+                        dispatch_topfore_to_workers(workers, single_pid, processed);
+                    }
+                }
                 dispatch_fg_top_to_workers(workers, *scanner_ptr, processed);
             }
         }

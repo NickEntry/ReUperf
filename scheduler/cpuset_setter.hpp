@@ -45,26 +45,10 @@ public:
         return true;
     }
     
-    bool move_to_cpuset_cgroup(int tid, const std::string& affinity_class, 
-                               ProcessState state, [[maybe_unused]] const std::string& cgroup_base) {
+    bool move_to_cpuset_cgroup(int tid, const std::string& cpumask_name) {
         if (tid <= 0) {
             LOG_W("CpusetSetter", "Invalid tid: " + std::to_string(tid));
             return false;
-        }
-        
-        auto cpus = matcher_.get_cpus_for_affinity(affinity_class, state);
-        
-        if (cpus.empty()) {
-            return true;
-        }
-        
-        std::string cpumask_name;
-        for (const auto& kv : matcher_.sched_config().cpumask) {
-            if (kv.second.size() == cpus.size() &&
-                std::equal(kv.second.begin(), kv.second.end(), cpus.begin())) {
-                cpumask_name = kv.first;
-                break;
-            }
         }
         
         if (cpumask_name.empty()) {
@@ -115,10 +99,11 @@ public:
     }
     
     bool apply_with_result(int /*pid*/, int tid, const MatchResult& result,
-                           const std::string& cgroup_base) {
+                           [[maybe_unused]] const std::string& cgroup_base) {
         LOG_D("CpusetSetter", "apply_with_result called: tid=" + std::to_string(tid) 
               + ", matched=" + std::to_string(result.matched)
               + ", affinity_class='" + result.affinity_class + "'"
+              + ", cpumask_name='" + result.cpumask_name + "'"
               + ", effective_state=" + std::to_string((int)result.effective_state));
         
         if (tid <= 0) {
@@ -134,8 +119,7 @@ public:
             if (!set_affinity(tid, result.affinity_class, result.effective_state)) {
                 return false;
             }
-            return move_to_cpuset_cgroup(tid, result.affinity_class, 
-                                        result.effective_state, cgroup_base);
+            return move_to_cpuset_cgroup(tid, result.cpumask_name);
         }
         
         LOG_D("CpusetSetter", "Skipped cpuset for tid " + std::to_string(tid) 
@@ -149,24 +133,6 @@ private:
     std::set<std::string> checked_groups_;  // 已检查过 cpus 的组
     std::set<std::string> skip_groups_;     // cpus 为空需跳过的组
     std::unordered_map<std::string, std::string> cpus_cache_;  // 缓存 cpus 文件内容
-    
-    // 静默写入 cgroup.procs（不记日志，用于非关键的父组先行写入）
-    static bool write_cgroup_procs_silent(const std::string& path, int tid) {
-        int fd = open(path.c_str(), O_WRONLY);
-        if (fd < 0) {
-            LOG_D("CpusetSetter", "write_cgroup_procs_silent: cannot open " + path);
-            return false;
-        }
-        std::string val = std::to_string(tid);
-        ssize_t ret = write(fd, val.c_str(), val.size());
-        int err = errno;
-        close(fd);
-        if (ret < 0 || ret != static_cast<ssize_t>(val.size())) {
-            LOG_D("CpusetSetter", "write_cgroup_procs_silent failed: " + std::string(strerror(err)));
-            return false;
-        }
-        return true;
-    }
 };
 
 #endif

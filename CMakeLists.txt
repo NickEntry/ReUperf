@@ -99,32 +99,4 @@ target_link_libraries(thread_scheduler PRIVATE
     nlohmann_json::nlohmann_json
 )
 
-# libcap 链接逻辑：
-# - 仅在原生 x86_64/x86 编译时链接 libcap（libcap-dev 提供的头文件和库）
-# - 交叉编译（ARM）或静态构建时跳过 libcap（使用代码中的 stub）
-if(CMAKE_C_COMPILER STREQUAL "/usr/bin/gcc" OR CMAKE_C_COMPILER STREQUAL "/usr/bin/c++")
-    # 原生 x86_64/x86 编译：检查 libcap-dev 是否已安装
-    find_package(PkgConfig QUIET)
-    pkg_check_modules(LIBCAP QUIET libcap)
-    if(LIBCAP_FOUND)
-        target_link_libraries(thread_scheduler PRIVATE ${LIBCAP_LIBRARIES})
-        message(STATUS "Found libcap, linking: ${LIBCAP_LIBRARIES}")
-    else()
-        message(STATUS "libcap-dev not found, will use stub")
-    endif()
-elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "i386" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "i686")
-    # 交叉编译 x86 架构：检查 libcap-dev
-    find_package(PkgConfig QUIET)
-    pkg_check_modules(LIBCAP QUIET libcap)
-    if(LIBCAP_FOUND)
-        target_link_libraries(thread_scheduler PRIVATE ${LIBCAP_LIBRARIES})
-        message(STATUS "Found libcap for cross-compile, linking: ${LIBCAP_LIBRARIES}")
-    else()
-        message(STATUS "libcap-dev not found for cross-compile, will use stub")
-    endif()
-else()
-    # ARM 交叉编译：跳过 libcap，使用 stub
-    message(STATUS "Cross-compile for ARM, using stub for capability functions")
-endif()
-
 install(TARGETS thread_scheduler DESTINATION bin)

@@ -11,78 +11,22 @@ class CpuctlSetter {
 public:
     CpuctlSetter() = default;
     
-    bool set_uclamp_max(int tid, int uclamp_max, const std::string& /*cpuctl_base*/,
-                        const std::string& rule_name) {
-        if (tid <= 0) {
-            LOG_W("CpuctlSetter", "Invalid tid: " + std::to_string(tid));
-            return false;
-        }
-        if (uclamp_max < 0 || uclamp_max > 100) {
-            LOG_W("CpuctlSetter", "Invalid uclamp_max: " + std::to_string(uclamp_max) 
-                  + " (valid range: 0-100)");
-            return false;
-        }
-        
-        std::string path = "/dev/cpuctl/ReUperf/" + rule_name;
-        
-        if (!FileUtils::write_file(path + "/cpu.uclamp.max", std::to_string(uclamp_max))) {
-            LOG_W("CpuctlSetter", "Failed to write cpu.uclamp.max for " + path);
-            return false;
-        }
-        
-        LOG_T("CpuctlSetter", "Set cpu.uclamp.max=" + std::to_string(uclamp_max) + " for " + path);
-        return migrate_thread(tid, path);
-    }
-    
-    bool set_cpu_share(int tid, int cpu_share, const std::string& /*cpuctl_base*/,
-                       const std::string& rule_name) {
-        if (tid <= 0) {
-            LOG_W("CpuctlSetter", "Invalid tid: " + std::to_string(tid));
-            return false;
-        }
-        if (cpu_share < 0 || cpu_share > 1024) {
-            LOG_W("CpuctlSetter", "Invalid cpu_share: " + std::to_string(cpu_share)
-                  + " (valid range: 0-1024, Android-specific)");
-            return false;
-        }
-        
-        std::string path = "/dev/cpuctl/ReUperf/" + rule_name;
-        
-        if (!FileUtils::write_file(path + "/cpu.shares", std::to_string(cpu_share))) {
-            LOG_W("CpuctlSetter", "Failed to write cpu.shares for " + path);
-            return false;
-        }
-        
-        LOG_T("CpuctlSetter", "Set cpu.shares=" + std::to_string(cpu_share) + " for " + path);
-        return migrate_thread(tid, path);
-    }
-    
-    std::string get_cpuctl_base(ProcessState /*state*/) {
-        return "/dev/cpuctl";
-    }
-    
     bool apply_with_result(int /*pid*/, int tid, const MatchResult& result) {
         if (!result.matched || !result.enable_limit) {
             return true;
         }
         
-        std::string base = get_cpuctl_base(result.effective_state);
-        
-        if (result.uclamp_max.has_value()) {
-            if (!set_uclamp_max(tid, result.uclamp_max.value(), 
-                                      base, result.matched_rule_name)) {
-                return false;
-            }
+        if (result.thread_rule_index < 0) {
+            LOG_W("CpuctlSetter", "enable_limit set but thread_rule_index is -1 for tid "
+                  + std::to_string(tid) + ", rule=" + result.matched_rule_name);
+            return false;
         }
+
+        // Path: /dev/cpuctl/ReUperf/{rule_name}/A{thread_rule_index+1}
+        std::string group_path = "/dev/cpuctl/ReUperf/" + result.matched_rule_name
+                               + "/A" + std::to_string(result.thread_rule_index + 1);
         
-        if (result.cpu_share.has_value()) {
-            if (!set_cpu_share(tid, result.cpu_share.value(),
-                                     base, result.matched_rule_name)) {
-                return false;
-            }
-        }
-        
-        return true;
+        return migrate_thread(tid, group_path);
     }
 
 private:

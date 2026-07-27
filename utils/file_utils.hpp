@@ -87,10 +87,10 @@ namespace {
         std::string content;
         std::chrono::steady_clock::time_point timestamp;
     };
-    std::unordered_map<std::string, FileCacheEntry> file_cache;
-    std::mutex file_cache_mutex;
-    std::unordered_map<std::string, std::list<std::string>::iterator> file_cache_order;
-    std::list<std::string> file_cache_lru;
+    inline std::unordered_map<std::string, FileCacheEntry> file_cache;
+    inline std::mutex file_cache_mutex;
+    inline std::unordered_map<std::string, std::list<std::string>::iterator> file_cache_order;
+    inline std::list<std::string> file_cache_lru;
     static constexpr int kFileCacheTTLMs = 100;
     static constexpr size_t kMaxCacheSize = 1000;
 }

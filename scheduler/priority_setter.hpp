@@ -191,6 +191,7 @@ private:
 #ifdef SCHED_BATCH
         return SCHED_BATCH;
 #else
+        LOG_W("PrioritySetter", "SCHED_BATCH not available on this platform, falling back to SCHED_OTHER");
         return normal_policy();
 #endif
     }
@@ -199,6 +200,7 @@ private:
 #ifdef SCHED_IDLE
         return SCHED_IDLE;
 #else
+        LOG_W("PrioritySetter", "SCHED_IDLE not available on this platform, falling back to SCHED_OTHER");
         return normal_policy();
 #endif
     }

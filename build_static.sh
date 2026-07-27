@@ -218,7 +218,7 @@ echo ""
 echo "Building..."
 cmake --build "$BUILD_DIR" -- -j$(nproc || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
-BIN="$BUILD_DIR/thread_scheduler_static"
+BIN="$BUILD_DIR/thread_scheduler"
 if [ -f "$BIN" ]; then
     echo ""
     echo "Stripping symbols..."
@@ -242,10 +242,4 @@ if [ -f "$BIN" ]; then
     echo ""
     echo "Dependencies:"
     ldd "$BIN" 2>&1 | head -5 || true
-fi
-
-# 重命名生成的二进制文件
-if [ -f "$BUILD_DIR/thread_scheduler" ]; then
-    mv "$BUILD_DIR/thread_scheduler" "$BUILD_DIR/thread_scheduler_static"
-    echo "已重命名: thread_scheduler -> thread_scheduler_static"
 fi
