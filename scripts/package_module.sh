@@ -74,6 +74,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 MODULE_TEMPLATE="$REPO_DIR/module_template"
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_DIR/out}"
+# 确保是绝对路径（避免 cd 后路径失效）
+OUTPUT_DIR="$(cd "$OUTPUT_DIR" 2>/dev/null && pwd || (mkdir -p "$OUTPUT_DIR" && cd "$OUTPUT_DIR" && pwd))"
 STAGING_DIR="$OUTPUT_DIR/.staging_${ARCH}_${BUILD_TYPE}"
 
 # 版本号：以构建时间为准，versionCode 恒为 1（便于覆盖安装测试）
