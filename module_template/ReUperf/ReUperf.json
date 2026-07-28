@@ -1,0 +1,93 @@
+{
+  "meta": {
+    "name": "1Prime+3Big+4Little ReUperf",
+    "author": "ReUperf"
+  },
+  "modules": {
+    "sched": {
+      "enable": true,
+      "refresh_interval_ms": 2500,
+      "highspeed_sched_ms": 200,
+      "log": {
+        "level": "info",
+        "output": "/data/adb/ReUperf/ReUperf.log"
+      },
+      "cpumask": {
+        "all": [0,1,2,3,4,5,6,7],
+        "c0": [0,1,2,3],
+        "0-6": [0,1,2,3,4,5,6],
+        "c1": [4,5,6],
+        "u6": [6],
+        "c2": [7],
+        "u4": [4],
+        "4-7": [4,5,6,7],
+        "6-7": [6,7]
+      },
+      "affinity": {
+        "auto": { "bg": "", "fg": "", "top": "" },
+        "norm": { "bg": "", "fg": "0-6", "top": "all" },
+        "bg": { "bg": "", "fg": "c0", "top": "c0" },
+        "junk": { "bg": "", "fg": "c0", "top": "0-6" },
+        "ui": { "bg": "", "fg": "all", "top": "0-6" },
+        "crit": { "bg": "", "fg": "all", "top": "0-6" },
+        "gtcoop": { "bg": "", "fg": "all", "top": "u6" },
+        "gtmain": { "bg": "", "fg": "all", "top": "c2" },
+        "0-4": { "bg": "", "fg": "0-6", "top": "0-6" },
+        "0-3,6": { "bg": "", "fg": "0-6", "top": "0-6" },
+        "0-3,7": { "bg": "", "fg": "0-6", "top": "0-6" },
+        "u4": { "bg": "", "fg": "u4", "top": "u4" },
+        "4-5": { "bg": "", "fg": "c1", "top": "c1" },
+        "4,6": { "bg": "", "fg": "c1", "top": "c1" },
+        "4,6,7": { "bg": "", "fg": "c1", "top": "c1" },
+        "4-6": { "bg": "", "fg": "c1", "top": "c1" },
+        "4-7": { "bg": "", "fg": "4-7", "top": "4-7" },
+        "u5": { "bg": "", "fg": "c1", "top": "c1" },
+        "5-6": { "bg": "", "fg": "c1", "top": "c1" },
+        "5,7": { "bg": "", "fg": "c1", "top": "c1" },
+        "u6": { "bg": "", "fg": "u6", "top": "u6" },
+        "6-7": { "bg": "", "fg": "6-7", "top": "6-7" },
+        "u7": { "bg": "", "fg": "c2", "top": "c2" }
+      },
+      "prio": {
+        "auto": { "bg": 0, "fg": 0, "top": 0 },
+        "bg": { "bg": -3, "fg": 139, "top": 139 },
+        "norm": { "bg": -1, "fg": -1, "top": 120 },
+        "coop": { "bg": -3, "fg": 124, "top": 122 },
+        "ui": { "bg": -3, "fg": 120, "top": 98 },
+        "rtusr": { "bg": 98, "fg": 98, "top": 97 },
+        "rtsys": { "bg": 97, "fg": 97, "top": 96 },
+        "game": { "bg": 136, "fg": 101, "top": 101 },
+        "game2": { "bg": 137, "fg": 102, "top": 102 },
+        "game3": { "bg": 138, "fg": 103, "top": 103 },
+        "game4": { "bg": 139, "fg": 104, "top": 104 },
+        "input": { "bg": -2, "fg": 98, "top": 98 },
+        "net": { "bg": 100, "fg": 98, "top": 98 },
+        "isnorm": { "bg": -2, "fg": 131, "top": 110 },
+        "junk": { "bg": 139, "fg": 0, "top": 0 },
+        "fw": { "bg": 139, "fg": 139, "top": 106 },
+        "ff": { "bg": 98, "fg": 98, "top": 98 }
+      },
+      "rules": [
+        {
+          "name": "Default rule",
+          "regex": ".",
+          "rules": [
+            { "k": "/MAIN_THREAD/", "ac": "ui", "pc": "ui" },
+            { "k": "AudioTrack", "ac": "norm", "pc": "ff" },
+            { "k": "^(UnityMain|RenderThread |GameThread)", "ac": "gtmain", "pc": "auto" },
+            { "k": "^(Unity|Worker Thread|TaskGraph|RHIThread|GLThread|Thread-|Job.Worker)", "ac": "gtcoop", "pc": "auto" },
+            { "k": "^(RenderThread|JNISurfaceText|IJK_External_Re)|[Aa]nim|([.]raster|[.]ui)$", "ac": "ui", "pc": "ui" },
+            { "k": "^(Chrome_InProc|CrRendererMain|CrGpuMain|CompositorTile)", "ac": "norm", "pc": "auto" },
+            { "k": "^(Viz|Chrome_|Compositor)|[Vv]sync|mali-", "ac": "ui", "pc": "ui" },
+            { "k": "^(OkHttp|Ysa|Xqa|Rx|APM|TVKDL-|tp-|cgi-|ODCP-|Bugly|xlog_)", "ac": "bg", "pc": "auto" },
+            { "k": "^(xg_vip_service|Profile|SearchDaemon|default_matrix|FrameDecoder|FrameSeq)", "ac": "bg", "pc": "auto" },
+            { "k": "^(GPU completion|HWC release|hwui|FramePolicy|ScrollPolicy|ged-swd)", "ac": "bg", "pc": "rtusr" },
+            { "k": "^(JS|libweexjsb|WeexJsBridge|mqt_native|mqt_js|JavaScriptTh)", "ac": "norm", "pc": "coop" },
+            { "k": "^(pool-|glide-|launcher-|Fresco)|[Dd]ownload|[Ss]chedule|[Ww]ork|[Pp]ool|[Dd]efau", "ac": "norm", "pc": "coop" },
+            { "k": ".", "ac": "auto", "pc": "auto" }
+          ]
+        }
+      ]
+    }
+  }
+}

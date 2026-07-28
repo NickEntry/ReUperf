@@ -197,4 +197,32 @@ if [ -f "$BIN" ]; then
     echo "Binary: $BIN"
     echo ""
     ls -lh "$BIN"
+    
+    # ── 打包 Magisk 模块 ──────────────────────────────────
+    echo ""
+    echo "=========================================="
+    echo "Packaging Magisk Module..."
+    echo "=========================================="
+    
+    PACKAGE_SCRIPT="$SCRIPT_DIR/scripts/package_module.sh"
+    if [ -f "$PACKAGE_SCRIPT" ]; then
+        chmod +x "$PACKAGE_SCRIPT"
+        
+        # 传递 NDK 路径 (动态版需要 libc++_shared.so)
+        NDK_ARG=""
+        if [ -n "$NDK" ] && [ -d "$NDK" ]; then
+            NDK_ARG="--ndk $NDK"
+        elif [ -n "$ANDROID_NDK_HOME" ] && [ -d "$ANDROID_NDK_HOME" ]; then
+            NDK_ARG="--ndk $ANDROID_NDK_HOME"
+        fi
+        
+        bash "$PACKAGE_SCRIPT" \
+            --binary "$BIN" \
+            --arch "$TARGET_ARCH" \
+            --type dynamic \
+            $NDK_ARG \
+            --output "$SCRIPT_DIR/out"
+    else
+        echo "WARNING: package_module.sh not found, skipping module packaging"
+    fi
 fi

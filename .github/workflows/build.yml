@@ -39,7 +39,7 @@ jobs:
     - name: Install Build Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake build-essential
+        sudo apt-get install -y cmake build-essential zip
 
     - name: Configure CMake
       run: |
@@ -72,10 +72,30 @@ jobs:
         file "$BINARY"
         echo "Binary validation passed"
 
-    - name: Upload Artifact
+    - name: Package Magisk Module
+      run: |
+        chmod +x scripts/package_module.sh
+        NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
+        echo "NDK path: $NDK_PATH"
+        bash scripts/package_module.sh \
+          --binary build/thread_scheduler \
+          --arch ${{ matrix.arch }} \
+          --type ${{ matrix.build_type }} \
+          --ndk "$NDK_PATH" \
+          --output out
+
+    - name: Upload Binary Artifact
       uses: actions/upload-artifact@v5
       with:
         name: thread_scheduler-${{ matrix.arch }}-${{ matrix.build_type }}
         path: build/thread_scheduler
+        retention-days: 30
+        if-no-files-found: error
+
+    - name: Upload Module Zip Artifact
+      uses: actions/upload-artifact@v5
+      with:
+        name: ReUperf-module-${{ matrix.arch }}-${{ matrix.build_type }}
+        path: out/ReUperf-*.zip
         retention-days: 30
         if-no-files-found: error

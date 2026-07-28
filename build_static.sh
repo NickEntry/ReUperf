@@ -242,4 +242,22 @@ if [ -f "$BIN" ]; then
     echo ""
     echo "Dependencies:"
     ldd "$BIN" 2>&1 | head -5 || true
+    
+    # ── 打包 Magisk 模块 ──────────────────────────────────
+    echo ""
+    echo "=========================================="
+    echo "Packaging Magisk Module..."
+    echo "=========================================="
+    
+    PACKAGE_SCRIPT="$SCRIPT_DIR/scripts/package_module.sh"
+    if [ -f "$PACKAGE_SCRIPT" ]; then
+        chmod +x "$PACKAGE_SCRIPT"
+        bash "$PACKAGE_SCRIPT" \
+            --binary "$BIN" \
+            --arch "$TARGET_ARCH" \
+            --type static \
+            --output "$SCRIPT_DIR/out"
+    else
+        echo "WARNING: package_module.sh not found, skipping module packaging"
+    fi
 fi
