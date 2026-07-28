@@ -78,9 +78,14 @@ OUTPUT_DIR="${OUTPUT_DIR:-$REPO_DIR/out}"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" 2>/dev/null && pwd || (mkdir -p "$OUTPUT_DIR" && cd "$OUTPUT_DIR" && pwd))"
 STAGING_DIR="$OUTPUT_DIR/.staging_${ARCH}_${BUILD_TYPE}"
 
-# 版本号：以构建时间为准，versionCode 恒为 1（便于覆盖安装测试）
-VERSION=$(date -u +"%Y-%m-%d %H:%M:%S" 2>/dev/null || date +"%Y-%m-%d %H:%M:%S")
-VERSION_SHORT=$(date -u +%Y%m%d%H%M%S 2>/dev/null || date +%Y%m%d%H%M%S)
+# 版本号：优先使用 git commit 时间（统一），否则用当前时间
+if git -C "$REPO_DIR" rev-parse HEAD >/dev/null 2>&1; then
+    VERSION=$(git -C "$REPO_DIR" log -1 --format=%ci --date=format:'%Y-%m-%d %H:%M:%S')
+    VERSION_SHORT=$(git -C "$REPO_DIR" log -1 --format=%ci --date=format:'%Y%m%d%H%M%S')
+else
+    VERSION=$(date -u +"%Y-%m-%d %H:%M:%S" 2>/dev/null || date +"%Y-%m-%d %H:%M:%S")
+    VERSION_SHORT=$(date -u +%Y%m%d%H%M%S 2>/dev/null || date +%Y%m%d%H%M%S)
+fi
 VERSION_CODE="1"
 
 # 模块 zip 文件名
