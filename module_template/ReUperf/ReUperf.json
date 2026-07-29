@@ -1,6 +1,6 @@
 {
   "meta": {
-    "name": "sdm8g1+ ReUperf",
+    "name": "Prime+3Big+4Little ReUperf",
     "author": "NickEntry"
   },
   "modules": {
@@ -94,8 +94,8 @@
         },
         "4-5": {
           "bg": "",
-          "fg": "c1",
-          "top": "c1"
+          "fg": "4-5",
+          "top": "4-5"
         },
         "4-6": {
           "bg": "",
@@ -520,6 +520,42 @@
             },
             {
               "k": "^(Worker Thread|Thread-|ace_worker|APM-)",
+              "ac": "4-5",
+              "pc": "game"
+            },
+            {
+              "k": ".",
+              "ac": "norm",
+              "pc": "game3"
+            }
+          ]
+        },
+        {
+          "name": "暗区突围",
+          "regex": "^com.tencent.tmgp.cf",
+          "rules": [
+            {
+              "k": "/MAIN_THREAD/",
+              "ac": "4-6",
+              "pc": "ui"
+            },
+            {
+              "k": "^GameThread",
+              "ac": "u7",
+              "pc": "game"
+            },
+            {
+              "k": "^RHIThread",
+              "ac": "u6",
+              "pc": "game"
+            },
+            {
+              "k": "^Unity",
+              "ac": "4-6",
+              "pc": "game2"
+            },
+            {
+              "k": "^(RenderThread|TaskGraph|PoolThread|Worker Thread|Thread-|ace_worker|APM-)",
               "ac": "4-5",
               "pc": "game"
             },
