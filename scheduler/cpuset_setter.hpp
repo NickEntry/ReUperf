@@ -3,7 +3,7 @@
 
 #include <string>
 #include <vector>
-#include <set>
+#include <chrono>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -55,28 +55,8 @@ public:
             return true;
         }
         
-        std::string path = "/dev/cpuset/ReUperf_" + cpumask_name;
-        bool group_ready = false;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (skip_groups_.count(path) > 0) {
-                return false;
-            }
-
-            if (!checked_groups_.count(path)) {
-                checked_groups_.insert(path);
-                cpus_cache_[path] = FileUtils::read_file(path + "/cpus");
-                if (cpus_cache_[path].empty()) {
-                    LOG_W("CpusetSetter", path + "/cpus is empty, skipping all moves to this group");
-                    skip_groups_.insert(path);
-                    return false;
-                }
-            }
-            group_ready = true;
-        }
-        if (!group_ready) {
-            return false;
-        }
+        const std::string path = "/dev/cpuset/ReUperf_" + cpumask_name;
+        if (!is_group_ready(path)) return false;
 
         // Keep this lightweight; do not over-defend against trusted local configuration.
         // 增加重试机制
@@ -84,7 +64,7 @@ public:
         constexpr int kRetryIntervalMs = 10;
         
         for (int retry = 0; retry < kMaxRetries; ++retry) {
-            if (FileUtils::write_file(path + "/tasks", std::to_string(tid))) {
+            if (FileUtils::write_kernel_control_file(path + "/tasks", std::to_string(tid))) {
                 LOG_T("CpusetSetter", "Moved tid " + std::to_string(tid) + " to cpuset " + path);
                 return true;
             }
@@ -94,6 +74,7 @@ public:
             }
         }
         
+        invalidate_group(path);
         LOG_W("CpusetSetter", "Failed to move tid " + std::to_string(tid) + " to " + path + " after " + std::to_string(kMaxRetries) + " retries");
         return false;
     }
@@ -152,10 +133,38 @@ public:
 
 private:
     ThreadMatcher& matcher_;
+    struct GroupCheck {
+        bool ready = false;
+        std::chrono::steady_clock::time_point checked_at;
+    };
+
+    static constexpr auto kGroupCheckTTL = std::chrono::seconds(1);
     mutable std::mutex mutex_;
-    std::set<std::string> checked_groups_;  // 已检查过 cpus 的组
-    std::set<std::string> skip_groups_;     // cpus 为空需跳过的组
-    std::unordered_map<std::string, std::string> cpus_cache_;  // 缓存 cpus 文件内容
+    std::unordered_map<std::string, GroupCheck> group_checks_;
+
+    bool is_group_ready(const std::string& path) {
+        const auto now = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto it = group_checks_.find(path);
+            if (it != group_checks_.end() && now - it->second.checked_at < kGroupCheckTTL) {
+                return it->second.ready;
+            }
+        }
+
+        const bool ready = !FileUtils::read_file(path + "/cpus").empty();
+        if (!ready) LOG_W("CpusetSetter", path + "/cpus is empty or unavailable");
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            group_checks_[path] = {ready, now};
+        }
+        return ready;
+    }
+
+    void invalidate_group(const std::string& path) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        group_checks_.erase(path);
+    }
 };
 
 #endif

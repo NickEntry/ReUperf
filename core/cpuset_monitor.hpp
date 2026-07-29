@@ -1,159 +1,185 @@
 #ifndef CPUSET_MONITOR_HPP
 #define CPUSET_MONITOR_HPP
 
+#include <atomic>
+#include <cerrno>
+#include <cstring>
+#include <cstdint>
+#include <functional>
 #include <string>
 #include <thread>
-#include <atomic>
-#include <functional>
-#include <cstring>
-#include <cerrno>
+#include <sys/eventfd.h>
 #include <sys/inotify.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <poll.h>
-#include "../utils/logger.hpp"
 #include "../utils/file_utils.hpp"
+#include "../utils/logger.hpp"
 
 class ProcMonitor {
 public:
     using Callback = std::function<void(int pid)>;
-    
-    ProcMonitor() : running_(false), started_(false), inotify_fd_(-1) {}
-    
+
+    ProcMonitor() : running_(false), started_(false), inotify_fd_(-1), stop_fd_(-1) {}
+
     ~ProcMonitor() {
         stop();
     }
-    
-    bool start(std::function<void(int pid)> on_process_change) {
+
+    bool start(Callback on_process_change) {
         if (started_.load()) {
             LOG_W("ProcMonitor", "start() called while already running, ignoring");
             return true;
         }
-        
-        on_process_change_ = on_process_change;
-        
-        inotify_fd_ = inotify_init();
+
+        // A monitor thread may have terminated after an inotify/poll error. Join it
+        // and release its descriptors before assigning a replacement std::thread.
+        if (thread_.joinable() || inotify_fd_ >= 0 || stop_fd_ >= 0) {
+            stop();
+        }
+
+        on_process_change_ = std::move(on_process_change);
+        inotify_fd_ = inotify_init1(IN_CLOEXEC);
         if (inotify_fd_ < 0) {
-            LOG_W("ProcMonitor", "inotify_init failed: " + std::string(strerror(errno)));
+            LOG_W("ProcMonitor", "inotify_init1 failed: " + std::string(strerror(errno)));
             return false;
         }
 
-        int wd = inotify_add_watch(inotify_fd_, "/proc", IN_CREATE | IN_DELETE | IN_ISDIR);
-        if (wd < 0) {
+        const int watch = inotify_add_watch(inotify_fd_, "/proc", IN_CREATE | IN_DELETE | IN_ISDIR);
+        if (watch < 0) {
             LOG_W("ProcMonitor", "Failed to watch /proc: " + std::string(strerror(errno)));
             close(inotify_fd_);
             inotify_fd_ = -1;
             return false;
         }
 
-        LOG_D("ProcMonitor", "Watching: /proc");
-        
-        running_ = true;
+        stop_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        if (stop_fd_ < 0) {
+            LOG_W("ProcMonitor", "eventfd failed: " + std::string(strerror(errno)));
+            close(inotify_fd_);
+            inotify_fd_ = -1;
+            return false;
+        }
+
+        running_.store(true);
+        started_.store(true);
         thread_ = std::thread(&ProcMonitor::monitor_loop, this);
-        
-        #ifdef __linux__
-        int ret = pthread_setname_np(thread_.native_handle(), "ProcMonitor");
+#ifdef __linux__
+        const int ret = pthread_setname_np(thread_.native_handle(), "ProcMonitor");
         if (ret != 0) {
             LOG_W("ProcMonitor", "Failed to set thread name: " + std::string(strerror(ret)));
         }
-        #endif
-        
+#endif
         LOG_I("ProcMonitor", "Started monitoring /proc changes");
-        started_ = true;
         return true;
     }
-    
+
     void stop() {
-        if (!running_.load()) return;
-        
-        running_.store(false);
-        
+        const bool was_started = started_.exchange(false);
+        const bool was_running = running_.exchange(false);
+        if (was_running && stop_fd_ >= 0) {
+            const uint64_t signal = 1;
+            if (write(stop_fd_, &signal, sizeof(signal)) < 0 && errno != EAGAIN) {
+                LOG_W("ProcMonitor", "Failed to signal monitor stop: " + std::string(strerror(errno)));
+            }
+        }
+        if (thread_.joinable()) {
+            thread_.join();
+        }
         if (inotify_fd_ >= 0) {
             close(inotify_fd_);
             inotify_fd_ = -1;
         }
-        
-        if (thread_.joinable()) {
-            thread_.join();
+        if (stop_fd_ >= 0) {
+            close(stop_fd_);
+            stop_fd_ = -1;
         }
-        
-        started_.store(false);
-        LOG_I("ProcMonitor", "Stopped");
+        if (was_started) {
+            LOG_I("ProcMonitor", "Stopped");
+        }
     }
-    
-    bool is_running() const { return started_.load(); }
+
+    bool is_running() const {
+        return started_.load();
+    }
 
 private:
     std::atomic<bool> running_;
     std::atomic<bool> started_;
     int inotify_fd_;
+    int stop_fd_;
     std::thread thread_;
-    std::function<void(int pid)> on_process_change_;
-    
+    Callback on_process_change_;
+
     void monitor_loop() {
-        constexpr size_t EVENT_SIZE = sizeof(struct inotify_event);
-        constexpr size_t BUF_LEN = 4096 * (EVENT_SIZE + 16);
-        char buf[BUF_LEN];
-        struct pollfd pfd = {inotify_fd_, POLLIN, 0};
+        constexpr size_t kEventSize = sizeof(inotify_event);
+        constexpr size_t kBufferSize = 4096 * (kEventSize + 16);
+        alignas(inotify_event) char buffer[kBufferSize];
+        pollfd poll_fds[2] = {
+            {inotify_fd_, POLLIN, 0},
+            {stop_fd_, POLLIN, 0},
+        };
 
         while (running_.load()) {
-            int ret = poll(&pfd, 1, 100);
+            const int ret = poll(poll_fds, 2, -1);
             if (ret < 0) {
-                if (errno == EINTR) continue;
+                if (errno == EINTR) {
+                    continue;
+                }
                 LOG_E("ProcMonitor", "poll error: " + std::string(strerror(errno)));
                 break;
             }
-            if (ret == 0) {
+            if (poll_fds[1].revents & POLLIN) {
+                uint64_t ignored = 0;
+                (void)read(stop_fd_, &ignored, sizeof(ignored));
+                break;
+            }
+            if (!(poll_fds[0].revents & POLLIN)) {
+                if (poll_fds[0].revents != 0) {
+                    LOG_E("ProcMonitor", "inotify poll error");
+                    break;
+                }
                 continue;
             }
 
-            ssize_t len = read(inotify_fd_, buf, BUF_LEN);
-            if (len < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            const ssize_t length = read(inotify_fd_, buffer, sizeof(buffer));
+            if (length < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
                     continue;
                 }
                 LOG_E("ProcMonitor", "read error: " + std::string(strerror(errno)));
                 break;
             }
-            
-            ssize_t i = 0;
-            while (i + static_cast<ssize_t>(EVENT_SIZE) <= len) {
-                struct inotify_event* event = reinterpret_cast<struct inotify_event*>(&buf[i]);
-                const ssize_t record_size = static_cast<ssize_t>(EVENT_SIZE) + event->len;
-                if (record_size > len - i) {
+
+            for (ssize_t offset = 0; offset + static_cast<ssize_t>(kEventSize) <= length;) {
+                const auto* event = reinterpret_cast<const inotify_event*>(&buffer[offset]);
+                const ssize_t record_size = static_cast<ssize_t>(kEventSize) + event->len;
+                if (record_size > length - offset) {
                     LOG_W("ProcMonitor", "Truncated inotify event record");
                     break;
                 }
-
                 if (event->len > 0) {
-                    // event->len includes the null terminator (per inotify(7)).
-                    // Use strnlen to get the actual name length without trailing nulls.
-                    std::string name(event->name, strnlen(event->name, event->len));
+                    const std::string name(event->name, strnlen(event->name, event->len));
                     if (FileUtils::is_all_digits(name.c_str())) {
                         errno = 0;
                         char* end = nullptr;
                         const long parsed_pid = strtol(name.c_str(), &end, 10);
                         if (errno == 0 && end != name.c_str() && *end == '\0'
-                            && FileUtils::is_valid_pid(parsed_pid)) {
+                            && FileUtils::is_valid_pid(parsed_pid) && on_process_change_) {
                             const int pid = static_cast<int>(parsed_pid);
                             if (event->mask & IN_CREATE) {
-                                LOG_D("ProcMonitor", "Process created: " + name);
-                                if (on_process_change_) {
-                                    on_process_change_(pid);
-                                }
+                                on_process_change_(pid);
                             } else if (event->mask & IN_DELETE) {
-                                LOG_D("ProcMonitor", "Process deleted: " + name);
-                                if (on_process_change_) {
-                                    on_process_change_(-pid);
-                                }
+                                on_process_change_(-pid);
                             }
                         }
                     }
                 }
-
-                i += record_size;
+                offset += record_size;
             }
         }
+        running_.store(false);
+        started_.store(false);
     }
 };
 

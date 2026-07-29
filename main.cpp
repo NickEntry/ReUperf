@@ -1,9 +1,12 @@
 #include <iostream>
 #include <chrono>
+#include <cstdlib>
+#include <limits.h>
 #include <thread>
 #include <algorithm>
 #include <atomic>
 #include <csignal>
+#include <map>
 #include <set>
 #include <cstdint>
 #include <cstring>
@@ -102,7 +105,11 @@ public:
     // The watcher reports observed writes; the main loop combines this signal
     // with mtime/hash detection and updates its baseline after a successful reload.
     explicit ConfigFileWatcher(const std::string& config_path)
-        : config_path_(config_path), inotify_fd_(-1), watch_fd_(-1), config_changed_(false) {}
+        : config_path_(config_path), inotify_fd_(-1), watch_fd_(-1), config_changed_(false) {
+        const size_t dir_pos = config_path_.rfind('/');
+        watch_dir_ = dir_pos == std::string::npos ? "." : config_path_.substr(0, dir_pos);
+        watch_basename_ = dir_pos == std::string::npos ? config_path_ : config_path_.substr(dir_pos + 1);
+    }
 
     ~ConfigFileWatcher() {
         stop();
@@ -110,34 +117,18 @@ public:
 
     bool start() {
 #ifdef __linux__
-        inotify_fd_ = inotify_init();
+        stop();
+        inotify_fd_ = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
         if (inotify_fd_ < 0) {
-            LOG_W("ConfigFileWatcher", "inotify_init failed: " + std::string(strerror(errno)));
+            LOG_W("ConfigFileWatcher", "inotify_init1 failed: " + std::string(strerror(errno)));
             return false;
         }
-        const int flags = fcntl(inotify_fd_, F_GETFL);
-        if (flags < 0 || fcntl(inotify_fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
-            LOG_W("ConfigFileWatcher", "Failed to make inotify non-blocking: "
-                  + std::string(strerror(errno)));
+        if (!add_watch()) {
             close(inotify_fd_);
             inotify_fd_ = -1;
             return false;
         }
-
-        size_t dir_pos = config_path_.rfind('/');
-        std::string dir = (dir_pos != std::string::npos) ? config_path_.substr(0, dir_pos) : ".";
-        std::string basename = (dir_pos != std::string::npos) ? config_path_.substr(dir_pos + 1) : config_path_;
-
-        watch_fd_ = inotify_add_watch(inotify_fd_, dir.c_str(), IN_MODIFY);
-        if (watch_fd_ < 0) {
-            LOG_W("ConfigFileWatcher", "inotify_add_watch failed: " + std::string(strerror(errno)));
-            close(inotify_fd_);
-            inotify_fd_ = -1;
-            return false;
-        }
-
         LOG_I("ConfigFileWatcher", "Watching config: " + config_path_);
-        watch_basename_ = basename;
         return true;
 #else
         return false;
@@ -149,37 +140,68 @@ public:
         if (inotify_fd_ >= 0) {
             close(inotify_fd_);
             inotify_fd_ = -1;
-            watch_fd_ = -1;
         }
+        watch_fd_ = -1;
 #endif
     }
 
     bool check_and_clear() {
 #ifdef __linux__
-        if (inotify_fd_ < 0) {
+        if (inotify_fd_ < 0 && !start()) {
             return false;
         }
 
-        char buf[1024];
-        ssize_t len = read(inotify_fd_, buf, sizeof(buf));
-        if (len > 0) {
-            for (ssize_t i = 0; i + static_cast<ssize_t>(sizeof(struct inotify_event)) <= len; ) {
-                struct inotify_event* event = reinterpret_cast<struct inotify_event*>(&buf[i]);
-                const ssize_t record_size = static_cast<ssize_t>(sizeof(struct inotify_event)) + event->len;
-                if (record_size > len - i) {
-                    LOG_W("ConfigFileWatcher", "Truncated inotify event record");
+        bool rewatch_needed = false;
+        alignas(inotify_event) char buffer[4096];
+        while (true) {
+            const ssize_t length = read(inotify_fd_, buffer, sizeof(buffer));
+            if (length < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     break;
                 }
-                if (event->len > 0 && watch_basename_.compare(
-                        0, std::string::npos, event->name,
-                        strnlen(event->name, event->len)) == 0) {
-                    if (event->mask & IN_MODIFY) {
-                        LOG_D("ConfigFileWatcher", "Config file modified");
-                        config_changed_.store(true, std::memory_order_release);
-                    }
+                if (errno == EINTR) {
+                    continue;
                 }
-                i += record_size;
+                LOG_W("ConfigFileWatcher", "inotify read failed: " + std::string(strerror(errno)));
+                rewatch_needed = true;
+                break;
             }
+            if (length == 0) {
+                rewatch_needed = true;
+                break;
+            }
+
+            for (ssize_t offset = 0;
+                 offset + static_cast<ssize_t>(sizeof(inotify_event)) <= length;) {
+                const auto* event = reinterpret_cast<const inotify_event*>(&buffer[offset]);
+                const ssize_t record_size = static_cast<ssize_t>(sizeof(inotify_event)) + event->len;
+                if (record_size > length - offset) {
+                    LOG_W("ConfigFileWatcher", "Truncated inotify event record");
+                    rewatch_needed = true;
+                    break;
+                }
+
+                if (event->mask & IN_Q_OVERFLOW) {
+                    LOG_W("ConfigFileWatcher", "inotify queue overflow; requesting config reload");
+                    config_changed_.store(true, std::memory_order_release);
+                }
+                if (event->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF)) {
+                    rewatch_needed = true;
+                }
+                if (event->len > 0
+                    && watch_basename_ == std::string(event->name, strnlen(event->name, event->len))
+                    && (event->mask & (IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO | IN_ATTRIB))) {
+                    LOG_D("ConfigFileWatcher", "Config file changed");
+                    config_changed_.store(true, std::memory_order_release);
+                }
+                offset += record_size;
+            }
+        }
+
+        if (rewatch_needed) {
+            LOG_W("ConfigFileWatcher", "Recreating config directory watch");
+            stop();
+            (void)start();
         }
         return config_changed_.exchange(false, std::memory_order_acq_rel);
 #else
@@ -187,12 +209,22 @@ public:
 #endif
     }
 
-    void clear_flag() {
-        config_changed_.store(false, std::memory_order_release);
-    }
-
 private:
+#ifdef __linux__
+    bool add_watch() {
+        constexpr uint32_t kWatchMask = IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO | IN_ATTRIB
+            | IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED | IN_Q_OVERFLOW;
+        watch_fd_ = inotify_add_watch(inotify_fd_, watch_dir_.c_str(), kWatchMask);
+        if (watch_fd_ < 0) {
+            LOG_W("ConfigFileWatcher", "inotify_add_watch failed: " + std::string(strerror(errno)));
+            return false;
+        }
+        return true;
+    }
+#endif
+
     std::string config_path_;
+    std::string watch_dir_;
     std::string watch_basename_;
     int inotify_fd_;
     int watch_fd_;
@@ -261,19 +293,29 @@ struct ScanCursor {
     int tid = 0;
 };
 
-void scan_and_update_rule_cache(ThreadMatcher& matcher,
+void scan_and_update_rule_cache(ThreadMatcher& matcher, ThreadCache& cache,
                                 std::set<int>& pinned_pids,
                                 std::set<int>& topfore_pids,
                                 std::set<int>& top_app_pids,
                                 std::set<int>& foreground_pids,
                                 std::set<int>& dead_pids) {
     const auto all_pids = FileUtils::list_pids();
+    std::map<int, uint64_t> live_processes;
+    std::set<std::pair<int, int>> live_threads;
 
     for (int pid : all_pids) {
+        const uint64_t process_start_time = FileUtils::get_process_start_time(pid);
+        if (process_start_time == 0) {
+            continue;
+        }
         const std::string proc_name = FileUtils::get_process_name_from_status(pid);
         if (proc_name == "[dead]") {
             dead_pids.insert(pid);
             continue;
+        }
+        live_processes.emplace(pid, process_start_time);
+        for (int tid : FileUtils::list_tids(pid)) {
+            live_threads.emplace(pid, tid);
         }
 
         const std::string cmdline = FileUtils::get_process_cmdline(pid);
@@ -299,6 +341,7 @@ void scan_and_update_rule_cache(ThreadMatcher& matcher,
             topfore_pids.insert(pid);
         }
     }
+    cache.retain_live_threads(live_processes, live_threads);
 }
 
 inline bool dispatch_pids_to_workers(
@@ -320,6 +363,13 @@ inline bool dispatch_pids_to_workers(
         const int worker_idx = pid % static_cast<int>(workers.size());
         const std::string proc_name = FileUtils::get_process_name_from_status(pid);
         if (proc_name != "[dead]") {
+            const uint64_t process_start_time = FileUtils::get_process_start_time(pid);
+            if (process_start_time == 0) {
+                cursor = {pid, 0};
+                ++pid_it;
+                if (pid_it == pids.end()) pid_it = pids.begin();
+                continue;
+            }
             const std::string cmdline = FileUtils::get_process_cmdline(pid);
             const auto tids = FileUtils::list_tids(pid);
             const int resume_after_tid = cursor.pid == pid ? cursor.tid : 0;
@@ -340,7 +390,7 @@ inline bool dispatch_pids_to_workers(
                     continue;
                 }
 
-                DispatchTask task{pid, tid, thread_name, state, cpuset_base, proc_name, cmdline};
+                DispatchTask task{pid, tid, process_start_time, thread_name, state, cpuset_base, proc_name, cmdline};
                 workers[worker_idx]->enqueue(task);
                 processed_tids.insert(tid);
             }
@@ -403,38 +453,82 @@ void cleanup_dead_pids(ThreadCache& cache, PinnedCache& pinned_cache,
 
 void restore_all_thread_baselines(ThreadCache& cache, CpusetSetter& cpuset,
                                   PrioritySetter& prio, CpuctlSetter& cpuctl) {
-    for (auto& [key, baseline] : cache.take_all_baselines()) {
-        const int tid = key.second;
-        if (baseline.has_affinity && !cpuset.restore_affinity(tid, baseline.affinity)) {
-            LOG_W("Main", "Failed to restore affinity for tid " + std::to_string(tid));
+    for (const auto& entry : cache.get_all_baselines()) {
+        const int pid = entry.pid;
+        const int tid = entry.tid;
+        const ThreadBaseline& baseline = entry.baseline;
+        if (FileUtils::get_process_start_time(pid) != entry.process_start_time
+            || !FileUtils::is_thread_in_process(pid, tid)) {
+            LOG_D("Main", "Discarding baseline for stale pid/tid identity: "
+                  + std::to_string(pid) + "/" + std::to_string(tid));
+            cache.erase_thread(pid, tid);
+            continue;
+        }
+
+        bool restored = true;
+        if (baseline.has_cpuctl_path && !cpuctl.restore_cpuctl_cgroup(tid, baseline.cpuctl_path)) {
+            LOG_W("Main", "Failed to restore cpuctl cgroup for tid " + std::to_string(tid));
+            restored = false;
         }
         if (baseline.has_scheduler && !prio.restore_scheduler(
                 tid, baseline.scheduler_policy, baseline.scheduler_priority, baseline.nice)) {
             LOG_W("Main", "Failed to restore scheduler for tid " + std::to_string(tid));
+            restored = false;
         }
         if (baseline.has_cpuset_path && !cpuset.restore_cpuset_cgroup(tid, baseline.cpuset_path)) {
             LOG_W("Main", "Failed to restore cpuset cgroup for tid " + std::to_string(tid));
+            restored = false;
         }
-        if (baseline.has_cpuctl_path && !cpuctl.restore_cpuctl_cgroup(tid, baseline.cpuctl_path)) {
-            LOG_W("Main", "Failed to restore cpuctl cgroup for tid " + std::to_string(tid));
+        if (baseline.has_affinity && !cpuset.restore_affinity(tid, baseline.affinity)) {
+            LOG_W("Main", "Failed to restore affinity for tid " + std::to_string(tid));
+            restored = false;
+        }
+        if (restored) {
+            cache.clear_baseline(pid, tid);
+            cache.clear_applied_result(pid, tid);
         }
     }
 }
 
+bool resolve_allowed_config_path(const std::string& user_path, const std::string& allowed_dir,
+                                 std::string& resolved_path) {
+#if defined(__linux__)
+    char resolved_dir[PATH_MAX];
+    char resolved_file[PATH_MAX];
+    if (realpath(allowed_dir.c_str(), resolved_dir) == nullptr
+        || realpath(user_path.c_str(), resolved_file) == nullptr) {
+        return false;
+    }
+
+    const std::string directory(resolved_dir);
+    const std::string file(resolved_file);
+    const std::string directory_prefix = directory + "/";
+    if (file.compare(0, directory_prefix.size(), directory_prefix) != 0) {
+        return false;
+    }
+
+    struct stat st {};
+    if (stat(file.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+        return false;
+    }
+    resolved_path = file;
+    return true;
+#else
+    (void)user_path;
+    (void)allowed_dir;
+    (void)resolved_path;
+    return false;
+#endif
+}
+
 int main(int argc, char* argv[]) {
-    // Whitelist config path - only allow files under /data/adb/ReUperf/
     std::string config_path = "/data/adb/ReUperf/ReUperf.json";
-    std::string allowed_dir = "/data/adb/ReUperf";
+    const std::string allowed_dir = "/data/adb/ReUperf";
     
     if (argc > 1 && argv[1] != nullptr) {
-        std::string user_path = argv[1];
-        
-        // Security: validate path is within allowed directory
-        if (user_path.find(allowed_dir) == 0 && 
-            user_path.find("..") == std::string::npos) {
-            config_path = user_path;
-        } else {
-            std::cerr << "Security: Config path must be under " << allowed_dir << std::endl;
+        if (!resolve_allowed_config_path(argv[1], allowed_dir, config_path)) {
+            std::cerr << "Security: Config path must resolve to a regular file under "
+                      << allowed_dir << std::endl;
             return 1;
         }
     }
@@ -466,13 +560,12 @@ int main(int argc, char* argv[]) {
     
     ensure_data_dir();
     
-    Config config;
-    try {
-        config = ConfigParser::parse(config_path);
-    } catch (const std::exception& e) {
-        std::cerr << "Failed to parse config: " << e.what() << std::endl;
+    const ConfigParseResult initial_parse = ConfigParser::parse(config_path);
+    if (!initial_parse.success) {
+        std::cerr << "Failed to parse config: " << config_path << std::endl;
         return 1;
     }
+    Config config = initial_parse.config;
     
     std::string log_path = config.sched.log.output;
     if (log_path.empty() || log_path == "stdout" || log_path == "stderr") {
@@ -535,7 +628,7 @@ int main(int argc, char* argv[]) {
         std::set<int> top_app_pids;
         std::set<int> foreground_pids;
 
-        scan_and_update_rule_cache(*matcher_ptr, pinned_pids, topfore_pids, top_app_pids,
+        scan_and_update_rule_cache(*matcher_ptr, *cache_ptr, pinned_pids, topfore_pids, top_app_pids,
                                    foreground_pids, dead_pids);
         pinned_cache->update(pinned_pids);
         topfore_cache->update(topfore_pids);
@@ -564,7 +657,8 @@ int main(int argc, char* argv[]) {
     g_event_router = std::make_shared<EventRouter>(50);
     
     ProcMonitor monitor;
-    monitor.start([&](int pid) {
+    const auto start_proc_monitor = [&]() {
+        return monitor.start([&](int pid) {
         if (pid > 0) {
             LOG_D("Main", "Process created: " + std::to_string(pid));
             g_event_router->on_process_created(pid);
@@ -572,15 +666,32 @@ int main(int argc, char* argv[]) {
             LOG_D("Main", "Process exited: " + std::to_string(-pid));
             g_event_router->on_process_exited(-pid);
         }
-    });
-    
-    g_event_router->start([&](const std::set<int>& new_pids, const std::set<int>& dead_pids) {
+        });
+    };
+    if (!start_proc_monitor()) {
+        LOG_W("Main", "Incremental /proc monitoring unavailable; relying on periodic full scans");
+        full_rescan_needed.store(true, std::memory_order_release);
+    }
+    auto next_monitor_restart = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+
+    g_event_router->start([&](const std::set<int>& new_pids, const std::set<int>& dead_pids,
+                              const std::set<int>& recycled_pids, bool events_dropped) {
+        if (events_dropped) {
+            LOG_W("Main", "Process events were dropped; requesting a compensating full scan");
+            full_rescan_needed.store(true, std::memory_order_release);
+        }
         // The callback runs on EventRouter's thread. Hold the same lock used by
         // configuration reload before accessing workers or scheduler objects.
         std::lock_guard<std::mutex> lock(scheduler_state_mutex);
-        (void)dead_pids;
+        for (int pid : recycled_pids) {
+            LOG_I("Main", "PID recycled, clearing cached thread state: " + std::to_string(pid));
+            cache_ptr->reset_for_pid(pid);
+            FileUtils::invalidate_process_caches(pid);
+        }
         for (int pid : new_pids) {
             if (pid > 0) {
+                cache_ptr->reset_for_pid(pid);
+                FileUtils::invalidate_process_caches(pid);
                 LOG_I("Main", "Incremental dispatch for new pid: " + std::to_string(pid));
                 const std::set<int> single_pid = {pid};
                 std::set<int> processed;
@@ -614,7 +725,10 @@ int main(int argc, char* argv[]) {
         for (int pid : dead_pids) {
             LOG_I("Main", "Cleaning up dead pid: " + std::to_string(pid));
             cache_ptr->reset_for_pid(pid);
+            FileUtils::invalidate_process_caches(pid);
         }
+    }, []() {
+        full_rescan_needed.store(true, std::memory_order_release);
     });
     
     ConfigFileWatcher config_watcher(config_path);
@@ -622,6 +736,9 @@ int main(int argc, char* argv[]) {
 
     time_t last_mtime = get_file_mtime(config_path);
     uint64_t last_config_hash = compute_config_hash(config_path);
+    uint64_t failed_config_hash = 0;
+    int config_retry_delay_seconds = 1;
+    auto next_config_retry = std::chrono::steady_clock::time_point::min();
     LOG_I("Main", "Initial config hash: " + std::to_string(last_config_hash));
     
     int highspeed_ms = std::max(config.sched.highspeed_sched_ms, 1);
@@ -645,92 +762,154 @@ int main(int argc, char* argv[]) {
         }
 
         try {
+        const auto monitor_now = std::chrono::steady_clock::now();
+        if (!monitor.is_running() && monitor_now >= next_monitor_restart) {
+            LOG_W("Main", "Incremental /proc monitor stopped; attempting restart");
+            if (!start_proc_monitor()) {
+                LOG_W("Main", "Incremental /proc monitor restart failed; continuing with periodic full scans");
+            }
+            full_rescan_needed.store(true, std::memory_order_release);
+            next_monitor_restart = monitor_now + std::chrono::seconds(5);
+        }
+
         const bool config_changed_inotify = config_watcher.check_and_clear();
         const time_t current_mtime = get_file_mtime(config_path);
         const uint64_t current_hash = compute_config_hash(config_path);
         const bool config_changed_fallback =
             (current_mtime != last_mtime && current_mtime > 0)
             || (current_hash != last_config_hash && current_hash != 0);
+        const auto config_check_now = std::chrono::steady_clock::now();
+        const bool retry_deferred = current_hash != 0 && current_hash == failed_config_hash
+            && config_check_now < next_config_retry;
 
-        if (config_changed_inotify || config_changed_fallback) {
+        if ((config_changed_inotify || config_changed_fallback) && !retry_deferred) {
             LOG_I("Main", "Config file changed, reloading...");
-            
+            bool reload_succeeded = false;
             try {
-                Config new_config = ConfigParser::parse(config_path);
-                
-                if (new_config.sched.enable) {
-                    config = new_config;
-                    
-                    LogLevel new_level = parse_log_level(config.sched.log.level);
-                    Logger::instance().set_level(new_level);
-                    LOG_I("Main", "Log level updated to: " + config.sched.log.level);
-                    
-                    config.launcher_package = LauncherFinder::find();
-                    if (!CgroupInitializer::init(config)) {
-                        LOG_E("Main", "Cgroup initialization failed");
-                    }
-                    
-                    // EventRouter can dispatch concurrently on its own thread.
-                    // Keep worker ownership and scheduler-object replacement atomic
-                    // with respect to that callback during reload.
-                    std::lock_guard<std::mutex> scheduler_lock(scheduler_state_mutex);
-
-                    for (auto& w : workers) {
-                        w->stop();
-                    }
-                    restore_all_thread_baselines(*cache_ptr, *cpuset_ptr, *prio_ptr, *cpuctl_ptr);
-
-                    auto new_matcher = std::make_shared<ThreadMatcher>(config);
-                    auto new_cpuset = std::make_shared<CpusetSetter>(*new_matcher);
-                    auto new_prio = std::make_shared<PrioritySetter>(*new_matcher);
-                    auto new_cpuctl = std::make_shared<CpuctlSetter>();
-
-                    cache_ptr->clear();
-                    pinned_cache->clear();
-                    topfore_cache->clear();
-
-                    workers.clear();
-                    workers.push_back(std::make_unique<ScanWorker>("ScanWorker1"));
-                    workers.push_back(std::make_unique<ScanWorker>("ScanWorker2"));
-                    workers.push_back(std::make_unique<ScanWorker>("ScanWorker3"));
-                    workers.push_back(std::make_unique<ScanWorker>("ScanWorker4"));
-
-                    matcher_ptr = std::move(new_matcher);
-                    cpuset_ptr = std::move(new_cpuset);
-                    prio_ptr = std::move(new_prio);
-                    cpuctl_ptr = std::move(new_cpuctl);
-
-                    for (auto& w : workers) {
-                        w->set_configs(matcher_ptr, cpuset_ptr, prio_ptr, cpuctl_ptr, cache_ptr);
-                        w->start();
-                    }
-                    
-                    highspeed_ms = std::max(config.sched.highspeed_sched_ms, 1);
-                    refresh_ms = std::max(config.sched.refresh_interval_ms, highspeed_ms);
-                    next_full_scan = std::chrono::steady_clock::now();
-                    cached_top_app_pids.clear();
-                    cached_foreground_pids.clear();
-                    top_cursor = {};
-                    pinned_cursor = {};
-                    topfore_cursor = {};
-                    foreground_cursor = {};
-
-                    LOG_I("Main", "Config reloaded - top=" + std::to_string(highspeed_ms)
-                          + "ms, full=" + std::to_string(refresh_ms) + "ms");
-                    
-                    last_mtime = current_mtime;
-                    last_config_hash = current_hash;
-                    full_rescan_needed.store(true);
+                ConfigParseResult parsed_config = ConfigParser::parse(config_path);
+                if (!parsed_config.success) {
+                    LOG_E("Main", "Config reload failed, keeping old config");
                 } else {
-                    LOG_I("Main", "New config has sched disabled, exiting");
-                    running = false;
+                    Config new_config = std::move(parsed_config.config);
+                    if (!new_config.sched.enable) {
+                        LOG_I("Main", "New config has sched disabled, exiting");
+                        running.store(false, std::memory_order_release);
+                        reload_succeeded = true;
+                    } else {
+                        new_config.launcher_package = LauncherFinder::find();
+                        if (!CgroupInitializer::init(new_config)) {
+                            LOG_E("Main", "Cgroup initialization failed; keeping old config");
+                        } else {
+                            // Build every replacement object before stopping the active scheduler.
+                            auto new_matcher = std::make_shared<ThreadMatcher>(new_config);
+                            auto new_cpuset = std::make_shared<CpusetSetter>(*new_matcher);
+                            auto new_prio = std::make_shared<PrioritySetter>(*new_matcher);
+                            auto new_cpuctl = std::make_shared<CpuctlSetter>();
+                            std::vector<std::unique_ptr<ScanWorker>> new_workers;
+                            for (int index = 1; index <= 4; ++index) {
+                                auto worker = std::make_unique<ScanWorker>(
+                                    "ScanWorker" + std::to_string(index));
+                                worker->set_configs(new_matcher, new_cpuset, new_prio, new_cpuctl, cache_ptr);
+                                new_workers.push_back(std::move(worker));
+                            }
+
+                            std::lock_guard<std::mutex> scheduler_lock(scheduler_state_mutex);
+                            Config old_config = config;
+                            auto old_matcher = matcher_ptr;
+                            auto old_cpuset = cpuset_ptr;
+                            auto old_prio = prio_ptr;
+                            auto old_cpuctl = cpuctl_ptr;
+                            auto old_workers = std::move(workers);
+
+                            for (auto& worker : old_workers) {
+                                worker->stop();
+                            }
+                            restore_all_thread_baselines(*cache_ptr, *old_cpuset, *old_prio, *old_cpuctl);
+
+                            config = std::move(new_config);
+                            matcher_ptr = std::move(new_matcher);
+                            cpuset_ptr = std::move(new_cpuset);
+                            prio_ptr = std::move(new_prio);
+                            cpuctl_ptr = std::move(new_cpuctl);
+                            workers = std::move(new_workers);
+
+                            bool workers_started = true;
+                            for (auto& worker : workers) {
+                                if (!worker->start()) {
+                                    workers_started = false;
+                                    break;
+                                }
+                            }
+                            if (!workers_started) {
+                                LOG_E("Main", "Failed to start replacement workers; restoring old scheduler");
+                                for (auto& worker : workers) {
+                                    worker->stop();
+                                }
+                                workers = std::move(old_workers);
+                                config = std::move(old_config);
+                                matcher_ptr = std::move(old_matcher);
+                                cpuset_ptr = std::move(old_cpuset);
+                                prio_ptr = std::move(old_prio);
+                                cpuctl_ptr = std::move(old_cpuctl);
+                                for (auto& worker : workers) {
+                                    worker->set_configs(matcher_ptr, cpuset_ptr, prio_ptr, cpuctl_ptr, cache_ptr);
+                                    if (!worker->start()) {
+                                        LOG_E("Main", "Failed to restart old worker after reload rollback");
+                                    }
+                                }
+                            } else {
+                                cache_ptr->clear_scheduling_state_preserving_baselines();
+                                pinned_cache->clear();
+                                topfore_cache->clear();
+                                cached_top_app_pids.clear();
+                                cached_foreground_pids.clear();
+                                top_cursor = {};
+                                pinned_cursor = {};
+                                topfore_cursor = {};
+                                foreground_cursor = {};
+                                highspeed_ms = std::max(config.sched.highspeed_sched_ms, 1);
+                                refresh_ms = std::max(config.sched.refresh_interval_ms, highspeed_ms);
+                                next_full_scan = std::chrono::steady_clock::now();
+
+                                std::string new_log_path = config.sched.log.output;
+                                if (new_log_path.empty() || new_log_path == "stdout" || new_log_path == "stderr") {
+                                    new_log_path = "/data/adb/ReUperf/ReUperf.log";
+                                }
+                                Logger::instance().init(parse_log_level(config.sched.log.level), new_log_path, true);
+                                LOG_I("Main", "Config reloaded - top=" + std::to_string(highspeed_ms)
+                                      + "ms, full=" + std::to_string(refresh_ms) + "ms");
+                                reload_succeeded = true;
+                            }
+                        }
+                    }
                 }
             } catch (const std::exception& e) {
                 LOG_E("Main", "Config reload failed: " + std::string(e.what())
                       + ", keeping old config");
+            } catch (...) {
+                LOG_E("Main", "Config reload failed with an unknown exception, keeping old config");
+            }
+
+            if (reload_succeeded) {
+                last_mtime = current_mtime;
+                last_config_hash = current_hash;
+                failed_config_hash = 0;
+                config_retry_delay_seconds = 1;
+                next_config_retry = std::chrono::steady_clock::time_point::min();
+                full_rescan_needed.store(true, std::memory_order_release);
+            } else if (current_hash != 0) {
+                if (failed_config_hash == current_hash) {
+                    config_retry_delay_seconds = std::min(config_retry_delay_seconds * 2, 5);
+                } else {
+                    failed_config_hash = current_hash;
+                    config_retry_delay_seconds = 1;
+                }
+                next_config_retry = config_check_now
+                    + std::chrono::seconds(config_retry_delay_seconds);
+                LOG_W("Main", "Deferring retry for unchanged failed config by "
+                      + std::to_string(config_retry_delay_seconds) + "s");
             }
         }
-        
         const auto now = std::chrono::steady_clock::now();
         const bool run_full_scan = full_rescan_needed.exchange(false, std::memory_order_acq_rel)
             || now >= next_full_scan;
@@ -744,7 +923,7 @@ int main(int argc, char* argv[]) {
             std::set<int> top_app_pids;
             std::set<int> foreground_pids;
 
-            scan_and_update_rule_cache(*matcher_ptr, pinned_pids, topfore_pids, top_app_pids,
+            scan_and_update_rule_cache(*matcher_ptr, *cache_ptr, pinned_pids, topfore_pids, top_app_pids,
                                        foreground_pids, dead_pids);
             pinned_cache->update(pinned_pids);
             topfore_cache->update(topfore_pids);

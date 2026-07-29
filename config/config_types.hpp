@@ -30,7 +30,6 @@ struct ThreadRule {
 struct ProcessRule {
     std::string name;
     std::string regex_str;       // 匹配 cmdline
-    std::string comm_regex_str;  // 匹配 comm (线程名)
     bool pinned = false;
     bool topfore = false;
     std::vector<ThreadRule> thread_rules;

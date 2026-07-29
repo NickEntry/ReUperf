@@ -14,7 +14,7 @@
 
 ### Termux（Android 设备直接编译）
 
-1. **CMake** (3.10 或更高版本)
+1. **CMake** (3.14 或更高版本)
    ```bash
    pkg install cmake
    ```
@@ -34,7 +34,7 @@
 1. **Android NDK** (r25c 或更高版本)
    - 下载地址：https://developer.android.com/ndk/downloads
 
-2. **CMake** (3.10 或更高版本)
+2. **CMake** (3.14 或更高版本)
 
 3. **nlohmann-json**
    - 优先使用系统包：`pkg install nlohmann-json`（Termux）

@@ -84,7 +84,7 @@ private:
                 continue;
             }
             
-            if (!FileUtils::write_file(child_path + "/cpus", cpus_str)) {
+            if (!FileUtils::write_kernel_control_file(child_path + "/cpus", cpus_str)) {
                 LOG_W("CgroupInit", "Failed to set cpus for " + child_path 
                       + " (cpus=" + cpus_str + ")");
                 failed++;
@@ -94,7 +94,7 @@ private:
             LOG_D("CgroupInit", "Set " + child_path + "/cpus = " + cpus_str);
             
             if (!root_mems.empty() && ensure_cgroup_file_exists(child_path + "/mems")) {
-                if (!FileUtils::write_file(child_path + "/mems", root_mems)) {
+                if (!FileUtils::write_kernel_control_file(child_path + "/mems", root_mems)) {
                     LOG_W("CgroupInit", "Failed to set mems for " + child_path);
                     failed++;
                     continue;
@@ -104,27 +104,29 @@ private:
             
             created++;
             
+            // ReUperf masks intentionally overlap. Keep these groups non-exclusive so
+            // their CPU and memory-node sets remain valid on cpuset v1 kernels.
             if (FileUtils::file_exists(child_path + "/cpu_exclusive")) {
                 int fd = open((child_path + "/cpu_exclusive").c_str(), O_WRONLY);
                 if (fd >= 0) {
-                    const char* v = "1";
+                    const char* v = "0";
                     ssize_t written = write(fd, v, 1);
                     int err = errno;
                     close(fd);
                     if (written != 1) {
-                        LOG_W("CgroupInit", "Failed to write cpu_exclusive: " + std::string(strerror(err)));
+                        LOG_W("CgroupInit", "Failed to disable cpu_exclusive: " + std::string(strerror(err)));
                     }
                 }
             }
             if (FileUtils::file_exists(child_path + "/mem_exclusive")) {
                 int fd = open((child_path + "/mem_exclusive").c_str(), O_WRONLY);
                 if (fd >= 0) {
-                    const char* v = "1";
+                    const char* v = "0";
                     ssize_t written = write(fd, v, 1);
                     int err = errno;
                     close(fd);
                     if (written != 1) {
-                        LOG_W("CgroupInit", "Failed to write mem_exclusive: " + std::string(strerror(err)));
+                        LOG_W("CgroupInit", "Failed to disable mem_exclusive: " + std::string(strerror(err)));
                     }
                 }
             }
@@ -181,7 +183,7 @@ private:
                 if (tr.uclamp_max.has_value()) {
                     std::string uclamp_path = sub_path + "/cpu.uclamp.max";
                     if (!FileUtils::file_exists(uclamp_path)
-                        || !FileUtils::write_file(uclamp_path, std::to_string(tr.uclamp_max.value()))) {
+                        || !FileUtils::write_kernel_control_file(uclamp_path, std::to_string(tr.uclamp_max.value()))) {
                         LOG_W("CgroupInit", "Failed to configure " + uclamp_path);
                         failed++;
                     }
@@ -189,7 +191,7 @@ private:
                 if (tr.cpu_share.has_value()) {
                     std::string shares_path = sub_path + "/cpu.shares";
                     if (!FileUtils::file_exists(shares_path)
-                        || !FileUtils::write_file(shares_path, std::to_string(tr.cpu_share.value()))) {
+                        || !FileUtils::write_kernel_control_file(shares_path, std::to_string(tr.cpu_share.value()))) {
                         LOG_W("CgroupInit", "Failed to configure " + shares_path);
                         failed++;
                     }

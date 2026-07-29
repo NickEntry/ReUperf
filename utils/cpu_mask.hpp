@@ -6,6 +6,8 @@
 #include <sstream>
 #include <algorithm>
 #include <exception>
+#include <cerrno>
+#include <cstdlib>
 #include <sched.h>
 #include <cstring>
 #include <dirent.h>
@@ -199,9 +201,12 @@ public:
             }
             if (!all_digits) continue;
 
-            int cpu_num = atoi(name + 3);
-            if (cpu_num >= 0) {
-                cpus.push_back(cpu_num);
+            errno = 0;
+            char* end = nullptr;
+            const long parsed_cpu = strtol(name + 3, &end, 10);
+            if (errno == 0 && end != name + 3 && *end == '\0'
+                && parsed_cpu >= 0 && parsed_cpu < CPU_SETSIZE) {
+                cpus.push_back(static_cast<int>(parsed_cpu));
             }
         }
         closedir(dir);

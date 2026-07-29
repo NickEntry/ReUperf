@@ -13,38 +13,43 @@
 
 using json = nlohmann::json;
 
+struct ConfigParseResult {
+    bool success = false;
+    Config config;
+};
+
 class ConfigParser {
 public:
-    static Config parse(const std::string& path) {
-        Config config;
+    static ConfigParseResult parse(const std::string& path) {
+        ConfigParseResult result;
 
         std::ifstream ifs(path);
         if (!ifs.is_open()) {
-            LOG_W("ConfigParser", "Config file not found: " + path + ", using default settings");
-            config.sched.enable = false;
-            return config;
+            LOG_W("ConfigParser", "Config file not found: " + path);
+            return result;
         }
 
         try {
             json j = json::parse(ifs);
             if (!j.is_object()) {
                 LOG_E("ConfigParser", "Config root must be an object");
-                config.sched.enable = false;
-                return config;
+                return result;
             }
 
-            parse_meta(j, config);
-            parse_sched(j, config);
+            parse_meta(j, result.config);
+            parse_sched(j, result.config);
+            result.success = true;
         } catch (const json::exception& e) {
             LOG_E("ConfigParser", "Invalid config: " + std::string(e.what()));
-            config.sched.enable = false;
+            return result;
         } catch (const std::exception& e) {
             LOG_E("ConfigParser", "Failed to parse config: " + std::string(e.what()));
-            config.sched.enable = false;
+            return result;
         }
 
-        LOG_I("ConfigParser", "Parsed config: " + config.meta_name + " by " + config.meta_author);
-        return config;
+        LOG_I("ConfigParser", "Parsed config: " + result.config.meta_name + " by "
+              + result.config.meta_author);
+        return result;
     }
 
 private:
@@ -253,6 +258,26 @@ private:
         }
     }
 
+    static bool is_valid_prio_value(int value) {
+        return value == 0 || (value >= 1 && value <= 98)
+            || (value >= 100 && value <= 139)
+            || value == -1 || value == -2 || value == -3;
+    }
+
+    static int parse_prio_value(const json& val, const char* state_name,
+                                const std::string& scene_name, int default_value) {
+        if (!val.contains(state_name) || !val[state_name].is_number_integer()) {
+            return default_value;
+        }
+        const int value = val[state_name].get<int>();
+        if (is_valid_prio_value(value)) {
+            return value;
+        }
+        LOG_W("ConfigParser", "Invalid prio[" + scene_name + "]." + state_name
+              + " value " + std::to_string(value) + ", using " + std::to_string(default_value));
+        return default_value;
+    }
+
     static void parse_prio(const json& sched, SchedConfig& cfg) {
         const auto prio_it = sched.find("prio");
         if (prio_it == sched.end()) {
@@ -272,16 +297,12 @@ private:
             }
 
             PrioScene scene;
-            if (val.contains("bg") && val["bg"].is_number_integer()) {
-                scene.bg = val["bg"].get<int>();
-            }
-            if (val.contains("fg") && val["fg"].is_number_integer()) {
-                scene.fg = val["fg"].get<int>();
-            }
-            if (val.contains("touch") && val["touch"].is_number_integer()) {
-                scene.top = val["touch"].get<int>();
-            } else if (val.contains("top") && val["top"].is_number_integer()) {
-                scene.top = val["top"].get<int>();
+            scene.bg = parse_prio_value(val, "bg", name, scene.bg);
+            scene.fg = parse_prio_value(val, "fg", name, scene.fg);
+            if (val.contains("touch")) {
+                scene.top = parse_prio_value(val, "touch", name, scene.top);
+            } else {
+                scene.top = parse_prio_value(val, "top", name, scene.top);
             }
 
             cfg.prio[name] = scene;
@@ -314,13 +335,18 @@ private:
                 LOG_W("ConfigParser", "Ignoring process rule with unsafe name: " + pr.name);
                 continue;
             }
-            if (rule.contains("regex") && rule["regex"].is_string()) {
-                pr.regex_str = rule["regex"].get<std::string>();
-            } else {
-                pr.regex_str = "^$";
+            if (!rule.contains("regex") || !rule["regex"].is_string()) {
+                LOG_W("ConfigParser", "Ignoring process rule '" + pr.name
+                      + "': regex must be a non-empty string");
+                continue;
             }
-            if (rule.contains("comm_regex") && rule["comm_regex"].is_string()) {
-                pr.comm_regex_str = rule["comm_regex"].get<std::string>();
+            pr.regex_str = rule["regex"].get<std::string>();
+            if (rule.contains("comm_regex")) {
+                LOG_W("ConfigParser", "Ignoring removed comm_regex in process rule '" + pr.name + "'");
+            }
+            if (pr.regex_str.empty()) {
+                LOG_W("ConfigParser", "Ignoring process rule '" + pr.name + "': regex must not be empty");
+                continue;
             }
             if (rule.contains("pinned") && rule["pinned"].is_boolean()) {
                 pr.pinned = rule["pinned"].get<bool>();

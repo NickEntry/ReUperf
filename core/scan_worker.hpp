@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <condition_variable>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -27,6 +28,7 @@
 struct DispatchTask {
     int pid;
     int tid;
+    uint64_t process_start_time;
     std::string thread_name;
     ProcessState state;
     std::string cpuset_base;
@@ -72,7 +74,11 @@ public:
         thread_ = std::thread(&ScanWorker::worker_loop, this);
         
         #ifdef __linux__
-        pthread_setname_np(thread_.native_handle(), name_.c_str());
+        const int setname_result = pthread_setname_np(thread_.native_handle(), name_.c_str());
+        if (setname_result != 0) {
+            LOG_W("ScanWorker", "Failed to set thread name for " + name_ + ": "
+                  + std::string(strerror(setname_result)));
+        }
         #endif
         
         LOG_I("ScanWorker", name_ + " started");
@@ -81,8 +87,7 @@ public:
     }
     
     void stop() {
-        if (!running_.load()) return;
-        
+        const bool was_started = started_.exchange(false);
         running_.store(false);
         cv_.notify_all();
         
@@ -96,14 +101,13 @@ public:
             queued_tasks_.clear();
         }
 
-        started_.store(false);
-        LOG_I("ScanWorker", name_ + " stopped");
+        if (was_started) LOG_I("ScanWorker", name_ + " stopped");
     }
     
     bool is_running() const { return started_.load(); }
     
     void enqueue(const DispatchTask& task) {
-        const uint64_t key = task_key(task.pid, task.tid);
+        const TaskKey key = task_key(task);
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (queued_tasks_.count(key) > 0) {
@@ -126,7 +130,28 @@ private:
     static constexpr size_t kMaxQueuedTasks = 4096;
     std::thread thread_;
     std::queue<DispatchTask> task_queue_;
-    std::unordered_set<uint64_t> queued_tasks_;
+    struct TaskKey {
+        int pid;
+        int tid;
+        uint64_t process_start_time;
+
+        bool operator==(const TaskKey& other) const {
+            return pid == other.pid && tid == other.tid
+                && process_start_time == other.process_start_time;
+        }
+    };
+
+    struct TaskKeyHash {
+        size_t operator()(const TaskKey& key) const {
+            size_t hash = std::hash<int>{}(key.pid);
+            hash ^= std::hash<int>{}(key.tid) + 0x9e3779b9U + (hash << 6) + (hash >> 2);
+            hash ^= std::hash<uint64_t>{}(key.process_start_time) + 0x9e3779b9U
+                + (hash << 6) + (hash >> 2);
+            return hash;
+        }
+    };
+
+    std::unordered_set<TaskKey, TaskKeyHash> queued_tasks_;
     std::mutex mutex_;
     std::condition_variable cv_;
     
@@ -136,9 +161,8 @@ private:
     std::shared_ptr<CpuctlSetter> cpuctl_;
     std::shared_ptr<ThreadCache> cache_;
 
-    static uint64_t task_key(int pid, int tid) {
-        return (static_cast<uint64_t>(static_cast<uint32_t>(pid)) << 32)
-            | static_cast<uint32_t>(tid);
+    static TaskKey task_key(const DispatchTask& task) {
+        return {task.pid, task.tid, task.process_start_time};
     }
     
     // 抖动抑制：记录每个 tid 的上次调度时间
@@ -195,13 +219,19 @@ private:
                 if (!task_queue_.empty()) {
                     task = task_queue_.front();
                     task_queue_.pop();
-                    queued_tasks_.erase(task_key(task.pid, task.tid));
+                    queued_tasks_.erase(task_key(task));
                 } else {
                     continue;
                 }
             }
             
-            process_dispatch_task(task);
+            try {
+                process_dispatch_task(task);
+            } catch (const std::exception& e) {
+                LOG_E("ScanWorker", name_ + " task failed: " + e.what());
+            } catch (...) {
+                LOG_E("ScanWorker", name_ + " task failed with unknown exception");
+            }
         }
     }
     
@@ -216,10 +246,6 @@ private:
 
     void capture_baseline_if_needed(const DispatchTask& task, ThreadCache& cache,
                                     PrioritySetter& prio) {
-        if (cache.has_baseline(task.pid, task.tid)) {
-            return;
-        }
-
         ThreadBaseline baseline;
         baseline.affinity = CpuMask::get_affinity_from_status(task.tid);
         baseline.has_affinity = !baseline.affinity.empty();
@@ -244,22 +270,34 @@ private:
 
     void restore_baseline(int pid, int tid, ThreadCache& cache, CpusetSetter& cpuset,
                           PrioritySetter& prio, CpuctlSetter& cpuctl) {
-        const auto baseline = cache.take_baseline(pid, tid);
+        const auto baseline = cache.get_baseline(pid, tid);
         if (!baseline) {
+            cache.clear_applied_result(pid, tid);
             return;
         }
-        if (baseline->has_affinity && !cpuset.restore_affinity(tid, baseline->affinity)) {
-            LOG_W("ScanWorker", name_ + " failed to restore affinity for tid " + std::to_string(tid));
+
+        bool restored = true;
+        // Reverse the apply order: cpuctl, scheduler, cpuset cgroup, then affinity.
+        if (baseline->has_cpuctl_path && !cpuctl.restore_cpuctl_cgroup(tid, baseline->cpuctl_path)) {
+            LOG_W("ScanWorker", name_ + " failed to restore cpuctl cgroup for tid " + std::to_string(tid));
+            restored = false;
         }
         if (baseline->has_scheduler && !prio.restore_scheduler(
                 tid, baseline->scheduler_policy, baseline->scheduler_priority, baseline->nice)) {
             LOG_W("ScanWorker", name_ + " failed to restore scheduler for tid " + std::to_string(tid));
+            restored = false;
         }
         if (baseline->has_cpuset_path && !cpuset.restore_cpuset_cgroup(tid, baseline->cpuset_path)) {
             LOG_W("ScanWorker", name_ + " failed to restore cpuset cgroup for tid " + std::to_string(tid));
+            restored = false;
         }
-        if (baseline->has_cpuctl_path && !cpuctl.restore_cpuctl_cgroup(tid, baseline->cpuctl_path)) {
-            LOG_W("ScanWorker", name_ + " failed to restore cpuctl cgroup for tid " + std::to_string(tid));
+        if (baseline->has_affinity && !cpuset.restore_affinity(tid, baseline->affinity)) {
+            LOG_W("ScanWorker", name_ + " failed to restore affinity for tid " + std::to_string(tid));
+            restored = false;
+        }
+        if (restored) {
+            cache.clear_baseline(pid, tid);
+            cache.clear_applied_result(pid, tid);
         }
     }
 
@@ -271,10 +309,34 @@ private:
             return;
         }
         capture_baseline_if_needed(task, cache, prio);
-        cache.update_applied_result(task.pid, task.tid, result);
-        cpuset.apply_with_result(task.pid, task.tid, result, cpuset_base);
-        prio.apply_with_result(task.pid, task.tid, result);
-        cpuctl.apply_with_result(task.pid, task.tid, result);
+        const auto baseline = cache.get_baseline(task.pid, task.tid);
+        const bool needs_affinity = !result.affinity_class.empty() && result.affinity_class != "auto";
+        const bool needs_priority = matcher.get_prio_value(result.prio_class, result.effective_state) != 0;
+        const bool needs_cpuset_cgroup = needs_affinity && !result.cpumask_name.empty();
+        if (!baseline || (needs_affinity && !baseline->has_affinity)
+            || (needs_cpuset_cgroup && !baseline->has_cpuset_path)
+            || (needs_priority && !baseline->has_scheduler)
+            || (result.enable_limit && !baseline->has_cpuctl_path)) {
+            LOG_W("ScanWorker", name_ + " skipped scheduling for tid " + std::to_string(task.tid)
+                  + " because its required baseline could not be captured");
+            return;
+        }
+
+        const bool cpuset_applied = cpuset.apply_with_result(task.pid, task.tid, result, cpuset_base);
+        const bool priority_applied = cpuset_applied
+            && prio.apply_with_result(task.pid, task.tid, result);
+        const bool cpuctl_applied = priority_applied
+            && cpuctl.apply_with_result(task.pid, task.tid, result);
+        if (cpuctl_applied) {
+            cache.update_applied_result(task.pid, task.tid, result);
+            return;
+        }
+
+        LOG_W("ScanWorker", name_ + " rolling back incomplete scheduling for tid "
+              + std::to_string(task.tid));
+        // CpusetSetter may have changed affinity before its cgroup migration failed.
+        // Restore the complete baseline so the next retry starts from a known state.
+        restore_baseline(task.pid, task.tid, cache, cpuset, prio, cpuctl);
     }
 
     void process_dispatch_task(const DispatchTask& task) {
@@ -287,11 +349,19 @@ private:
             LOG_E("ScanWorker", name_ + " configs null during task processing");
             return;
         }
+        if (FileUtils::get_process_start_time(task.pid) != task.process_start_time
+            || !FileUtils::is_thread_in_process(task.pid, task.tid)) {
+            LOG_D("ScanWorker", name_ + " dropping stale task for pid " + std::to_string(task.pid)
+                  + ", tid " + std::to_string(task.tid));
+            cache->erase_thread(task.pid, task.tid);
+            return;
+        }
         if (should_skip_schedule(task.tid)) {
             return;
         }
 
-        if (const auto entry = cache->lookup(task.pid, task.tid, task.thread_name, task.state)) {
+        if (const auto entry = cache->lookup(task.pid, task.tid, task.process_start_time,
+                                             task.thread_name, task.cmdline, task.state)) {
             const auto applied = cache->get_applied_result(task.pid, task.tid);
             if (applied && is_result_equal(*applied, entry->result)) {
                 if (!needs_managed_state(*applied, *matcher)) {
@@ -319,8 +389,8 @@ private:
         const MatchResult result = matcher->match(task.proc_name, task.thread_name,
                                                    task.state, task.pid, task.cmdline);
         const std::string cpuctl_base = cpuctl->get_cpuctl_base(result.effective_state);
-        cache->update(task.pid, task.tid, task.thread_name, task.state,
-                      result, task.cpuset_base, cpuctl_base);
+        cache->update(task.pid, task.tid, task.process_start_time, task.thread_name, task.cmdline,
+                      task.state, result, task.cpuset_base, cpuctl_base);
         apply_result(task, result, task.cpuset_base, *matcher, *cache,
                      *cpuset, *prio, *cpuctl);
     }

@@ -1,6 +1,7 @@
 #ifndef THREAD_MATCHER_HPP
 #define THREAD_MATCHER_HPP
 
+#include <algorithm>
 #include <string>
 #include <regex>
 #include <vector>
@@ -48,9 +49,7 @@ struct CompiledThreadRule {
 
 struct CompiledProcessRule {
     ProcessRule rule;
-    std::regex pattern;        // 匹配 cmdline
-    std::regex comm_pattern;   // 匹配 comm
-    bool has_comm_pattern = false;  // 标记 comm_pattern 是否已初始化
+    std::regex pattern;  // 匹配进程 cmdline 或进程名
     std::vector<CompiledThreadRule> thread_rules;
 };
 
@@ -73,9 +72,6 @@ public:
             std::string expanded = expand_process_regex(process_regex.pattern,
                 launcher_package_, "");
             
-            // Wrap with .* for contains-match semantics
-            expanded = ".*" + expanded + ".*";
-            
             // Keep only the configured maximum entry size; ReDoS filtering is intentionally omitted.
             if (expanded.length() > kMaxRegexLength) {
                 LOG_W("ThreadMatcher", "Skip regex exceeding " + std::to_string(kMaxRegexLength) 
@@ -90,28 +86,6 @@ public:
                 continue;
             }
 
-            if (!rule.comm_regex_str.empty() && rule.comm_regex_str != "^$") {
-                RegexPattern comm_regex = parse_regex_pattern(rule.comm_regex_str);
-                std::string comm_expanded = expand_process_regex(comm_regex.pattern,
-                    launcher_package_, "");
-                
-                // Wrap with .* for contains-match semantics
-                comm_expanded = ".*" + comm_expanded + ".*";
-
-                // Keep only the configured maximum entry size; ReDoS filtering is intentionally omitted.
-                if (comm_expanded.length() > kMaxRegexLength) {
-                    LOG_W("ThreadMatcher", "Skip comm_regex exceeding " + std::to_string(kMaxRegexLength) 
-                          + " chars: " + rule.comm_regex_str);
-                } else {
-                    try {
-                        cr.comm_pattern = std::regex(comm_expanded, regex_flags_for(comm_regex, regex_flags));
-                        cr.has_comm_pattern = true;
-                    } catch (const std::regex_error&) {
-                        LOG_W("ThreadMatcher", "Skip invalid comm process regex: " + rule.comm_regex_str);
-                    }
-                }
-            }
-
             for (size_t source_rule_index = 0; source_rule_index < rule.thread_rules.size(); ++source_rule_index) {
                 const auto& tr = rule.thread_rules[source_rule_index];
                 CompiledThreadRule ctr;
@@ -124,9 +98,6 @@ public:
                     ctr.is_main_thread_rule = true;
                 } else {
                     std::string tk = expand_thread_regex(thread_regex.pattern, "");
-                    
-                    // Wrap with .* for contains-match semantics
-                    tk = ".*" + tk + ".*";
                     
                     // Keep only the configured maximum entry size; ReDoS filtering is intentionally omitted.
                     if (tk.length() > kMaxRegexLength) {
@@ -300,21 +271,17 @@ private:
         CompiledProcessRule* matched_rule = nullptr;
 
         for (auto& cr : compiled_rules_) {
-            bool cmdline_matched = !cmdline.empty() && std::regex_search(cmdline, cr.pattern);
-            bool comm_matched = std::regex_search(proc_name, cr.pattern);
-            if (cmdline_matched || comm_matched) {
-                matched_rule = &cr;
-                break;
-            }
-
-            if (cr.has_comm_pattern && std::regex_search(proc_name, cr.comm_pattern)) {
-                matched_rule = &cr;
-                break;
-            }
-
-            if (cr.rule.regex_str == "." || cr.rule.regex_str == "*" || cr.rule.regex_str.empty()) {
-                matched_rule = &cr;
-                break;
+            try {
+                const bool cmdline_matched = !cmdline.empty()
+                    && std::regex_search(cmdline, cr.pattern);
+                const bool process_name_matched = std::regex_search(proc_name, cr.pattern);
+                if (cmdline_matched || process_name_matched) {
+                    matched_rule = &cr;
+                    break;
+                }
+            } catch (const std::regex_error& e) {
+                LOG_W("ThreadMatcher", "Process regex match failed for rule '" + cr.rule.name
+                      + "': " + e.what());
             }
         }
 
@@ -348,7 +315,14 @@ private:
                         break;
                     }
                 } else {
-                    if (std::regex_search(thread_name, ctr.pattern)) {
+                    bool thread_matched = false;
+                    try {
+                        thread_matched = std::regex_search(thread_name, ctr.pattern);
+                    } catch (const std::regex_error& e) {
+                        LOG_W("ThreadMatcher", "Thread regex match failed for rule '"
+                              + matched_rule->rule.name + "': " + e.what());
+                    }
+                    if (thread_matched) {
                         result.affinity_class = ctr.rule.affinity_class;
                         result.prio_class = ctr.rule.prio_class;
                         result.uclamp_max = ctr.rule.uclamp_max;
@@ -425,6 +399,7 @@ private:
     };
 
     static constexpr int64_t kProcessCacheTTLMs = 100;
+    static constexpr size_t kMaxProcessCacheEntriesPerBucket = 256;
 
     // 细粒度锁：分桶策略
     static constexpr size_t kCacheBuckets = 16;
@@ -451,9 +426,32 @@ private:
     }
 
     void cache_process_result(const std::string& proc_name, const ProcessCacheEntry& entry) {
-        size_t bucket = get_cache_bucket(proc_name);
+        const size_t bucket = get_cache_bucket(proc_name);
         std::lock_guard<std::mutex> lock(process_cache_mutex_[bucket]);
-        process_cache_[bucket][proc_name] = entry;
+        auto& cache = process_cache_[bucket];
+        const auto now = std::chrono::steady_clock::now();
+
+        for (auto it = cache.begin(); it != cache.end();) {
+            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - it->second.timestamp).count();
+            if (elapsed_ms >= kProcessCacheTTLMs) {
+                it = cache.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        if (cache.find(proc_name) == cache.end()
+            && cache.size() >= kMaxProcessCacheEntriesPerBucket) {
+            const auto oldest = std::min_element(cache.begin(), cache.end(),
+                [](const auto& left, const auto& right) {
+                    return left.second.timestamp < right.second.timestamp;
+                });
+            if (oldest != cache.end()) {
+                cache.erase(oldest);
+            }
+        }
+        cache[proc_name] = entry;
     }
 };
 

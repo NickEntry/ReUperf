@@ -59,37 +59,55 @@ inline bool mkdir_recursive(const std::string& path) {
     return true;
 }
 
-inline bool write_file(const std::string& path, const std::string& content) {
-    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+inline bool is_dynamic_kernel_path(const std::string& path) {
+    return path.rfind("/proc/", 0) == 0 || path.rfind("/dev/cpuset/", 0) == 0
+        || path.rfind("/dev/cpuctl/", 0) == 0;
+}
+
+inline void invalidate_file_cache(const std::string& path);
+
+inline bool write_open_file(const std::string& path, const std::string& content, int flags,
+                            const char* operation) {
+    const int fd = open(path.c_str(), flags, 0644);
     if (fd < 0) {
-        LOG_E("FileUtils", "write_file open failed: " + path + " (" + std::string(strerror(errno)) + ")");
+        LOG_E("FileUtils", std::string(operation) + " open failed: " + path + " ("
+              + std::string(strerror(errno)) + ")");
         return false;
     }
-    
-    ssize_t written = 0;
-    ssize_t total = static_cast<ssize_t>(content.size());
-    const char* buf = content.c_str();
-    
-    while (written < total) {
-        ssize_t ret = write(fd, buf + written, total - written);
+
+    size_t written = 0;
+    while (written < content.size()) {
+        const ssize_t ret = write(fd, content.data() + written, content.size() - written);
         if (ret < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            LOG_E("FileUtils", "write failed: " + path + " (" + std::string(strerror(errno)) + ")");
+            LOG_E("FileUtils", std::string(operation) + " write failed: " + path + " ("
+                  + std::string(strerror(errno)) + ")");
             close(fd);
             return false;
         }
         if (ret == 0) {
-            LOG_E("FileUtils", "write returned zero bytes: " + path);
+            LOG_E("FileUtils", std::string(operation) + " write returned zero bytes: " + path);
             close(fd);
             return false;
         }
-        written += ret;
+        written += static_cast<size_t>(ret);
     }
-    
+
     close(fd);
+    invalidate_file_cache(path);
     return true;
+}
+
+inline bool write_file(const std::string& path, const std::string& content) {
+    return write_open_file(path, content, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, "write_file");
+}
+
+// Kernel control files such as cgroup tasks, cpus and cpu.shares must already
+// exist. Do not create or truncate them: these pseudo-files define write semantics.
+inline bool write_kernel_control_file(const std::string& path, const std::string& content) {
+    return write_open_file(path, content, O_WRONLY | O_CLOEXEC, "write_kernel_control_file");
 }
 
 namespace {
@@ -123,9 +141,15 @@ namespace {
     }
 }
 
+inline void invalidate_file_cache(const std::string& path) {
+    std::lock_guard<std::mutex> lock(file_cache_mutex);
+    erase_file_cache_entry(path);
+}
+
 inline std::string read_file(const std::string& path) {
+    const bool cacheable = !is_dynamic_kernel_path(path);
     auto now = std::chrono::steady_clock::now();
-    {
+    if (cacheable) {
         std::lock_guard<std::mutex> lock(file_cache_mutex);
         auto it = file_cache.find(path);
         if (it != file_cache.end() && std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -146,7 +170,7 @@ inline std::string read_file(const std::string& path) {
         content.pop_back();
     }
     
-    {
+    if (cacheable) {
         std::lock_guard<std::mutex> lock(file_cache_mutex);
         const bool replacing = file_cache.find(path) != file_cache.end();
         if (!replacing && file_cache.size() >= kMaxCacheSize && !file_cache_lru.empty()) {
@@ -194,6 +218,53 @@ inline std::vector<int> list_pids() {
     }
     closedir(dir);
     return pids;
+}
+
+inline uint64_t get_process_start_time(int pid) {
+    if (!is_valid_pid(pid)) return 0;
+
+    const std::string stat = read_file("/proc/" + std::to_string(pid) + "/stat");
+    const size_t closing_paren = stat.rfind(')');
+    if (closing_paren == std::string::npos || closing_paren + 2 >= stat.size()) return 0;
+
+    std::istringstream fields(stat.substr(closing_paren + 2));
+    std::string field;
+    // starttime is field 22; the suffix starts at field 3.
+    for (int index = 3; index <= 22 && std::getline(fields, field, ' '); ++index) {
+        if (index != 22 || field.empty()) continue;
+        errno = 0;
+        char* end = nullptr;
+        const unsigned long long value = strtoull(field.c_str(), &end, 10);
+        return errno == 0 && end != field.c_str() && *end == '\0'
+            ? static_cast<uint64_t>(value) : 0;
+    }
+    return 0;
+}
+
+inline bool is_thread_in_process(int pid, int tid) {
+    if (!is_valid_pid(pid) || !is_valid_tid(tid)) {
+        return false;
+    }
+
+    const std::string status = read_file("/proc/" + std::to_string(pid) + "/task/"
+        + std::to_string(tid) + "/status");
+    if (status.empty()) {
+        return false;
+    }
+
+    std::istringstream iss(status);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (line.compare(0, 5, "Tgid:") != 0) {
+            continue;
+        }
+        errno = 0;
+        char* end = nullptr;
+        const long tgid = strtol(line.c_str() + 5, &end, 10);
+        return errno == 0 && end != line.c_str() + 5 && is_valid_pid(tgid)
+            && tgid == pid;
+    }
+    return false;
 }
 
 inline std::vector<int> list_tids(int pid) {
@@ -525,14 +596,14 @@ inline std::vector<int> read_cgroup_procs(const std::string& path) {
 }
 
 inline bool write_cgroup_procs(const std::string& path, int tid) {
-    return write_file(path + "/cgroup.procs", std::to_string(tid));
+    return write_kernel_control_file(path + "/cgroup.procs", std::to_string(tid));
 }
 
 // Write a single thread (TID) to a cgroup's tasks file.
 // Unlike cgroup.procs (which moves the whole process), tasks moves only
 // the specified thread, enabling per-thread cgroup grouping.
 inline bool write_cgroup_tasks(const std::string& path, int tid) {
-    return write_file(path + "/tasks", std::to_string(tid));
+    return write_kernel_control_file(path + "/tasks", std::to_string(tid));
 }
 
 // 进程信息缓存
@@ -595,6 +666,25 @@ inline std::pair<std::string, std::string> get_process_info_cached(int pid) {
     
     cache[pid] = {name, cmdline, now};
     return {name, cmdline};
+}
+
+inline void invalidate_process_caches(int pid) {
+    if (!is_valid_pid(pid)) return;
+    {
+        std::lock_guard<std::mutex> lock(get_cgroup_cache_mutex());
+        auto& cache = get_cgroup_cache();
+        for (auto it = cache.begin(); it != cache.end();) {
+            const uint64_t key = it->first.pid;
+            const int cached_pid = static_cast<int>(key >> 32) == 0
+                ? static_cast<int>(key) : static_cast<int>(key >> 32);
+            if (cached_pid == pid) it = cache.erase(it);
+            else ++it;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(get_proc_info_cache_mutex());
+        get_proc_info_cache().erase(pid);
+    }
 }
 
 }

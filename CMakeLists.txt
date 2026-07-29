@@ -1,102 +1,72 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.14)
 project(thread_scheduler LANGUAGES CXX)
-
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(BUILD_STATIC "Build static executable" OFF)
 
+set(REUPERF_COMPILE_OPTIONS)
+set(REUPERF_LINK_OPTIONS)
+
 if(BUILD_STATIC)
     message(STATUS "Building with static linking")
-    set(BUILD_SHARED_LIBS OFF)
-    
-    # 检查是否在 Termux 环境
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND EXISTS "/data/data/com.termux")
-        # Termux 环境：检查静态库是否可用
         find_library(LIBC_STATIC c PATHS /data/data/com.termux/files/usr/lib NO_DEFAULT_PATH)
         find_library(LIBM_STATIC m PATHS /data/data/com.termux/files/usr/lib NO_DEFAULT_PATH)
         find_library(LIBCXX_STATIC c++ PATHS /data/data/com.termux/files/usr/lib NO_DEFAULT_PATH)
-        
-        # 检查静态库是否全部存在
         if(LIBC_STATIC AND LIBM_STATIC AND LIBCXX_STATIC)
-            message(STATUS "Termux: 检测到静态库，启用静态链接")
-            message(STATUS "  libc.a: ${LIBC_STATIC}")
-            message(STATUS "  libm.a: ${LIBM_STATIC}")
-            message(STATUS "  libc++.a: ${LIBCXX_STATIC}")
-            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
+            message(STATUS "Termux: detected static libraries, enabling static linking")
+            list(APPEND REUPERF_LINK_OPTIONS -static)
         else()
-            message(WARNING "Termux: 未找到完整的静态库，将使用动态链接")
-            message(WARNING "如需静态链接，请运行:")
-            message(WARNING "  pkg install ndk-sysroot ndk-multilib-native-static libandroid-support-static")
-            # 禁用静态链接，使用动态链接
+            message(WARNING "Termux: complete static libraries not found; using dynamic linking")
+            message(WARNING "For static linking: pkg install ndk-sysroot ndk-multilib-native-static libandroid-support-static")
             set(BUILD_STATIC OFF CACHE BOOL "Build static executable" FORCE)
         endif()
     else()
-        # 非 Termux 环境：正常静态链接
-        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
+        list(APPEND REUPERF_LINK_OPTIONS -static)
     endif()
 endif()
 
-# 在 Termux 环境中使用 lld 链接器（修复 tagged pointers 问题）
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND EXISTS "/data/data/com.termux")
-    # 检查 lld 是否可用
     find_program(LLD_EXECUTABLE lld)
     if(LLD_EXECUTABLE)
-        message(STATUS "检测到 lld，使用 lld 链接器（修复 tagged pointers 问题）")
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fuse-ld=lld")
-        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=lld")
+        message(STATUS "Termux: using lld linker")
+        list(APPEND REUPERF_COMPILE_OPTIONS -fuse-ld=lld)
+        list(APPEND REUPERF_LINK_OPTIONS -fuse-ld=lld)
     else()
-        message(WARNING "未找到 lld，尝试使用默认链接器")
-        # 备选方案：禁用 PIE
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-PIE")
-        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -no-pie")
+        message(WARNING "Termux: lld not found; disabling PIE as fallback")
+        list(APPEND REUPERF_COMPILE_OPTIONS -fno-PIE)
+        list(APPEND REUPERF_LINK_OPTIONS -no-pie)
     endif()
 endif()
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -O2")
-
-# 始终使用 stub 来避免 libcap 链接问题
-# stub 提供空的 capability 函数实现
-set(USE_CAPABILITY_STUB ON)
-message(STATUS "Using stub for capability functions (cross-platform)")
-
-# 注意：target_compile_definitions 将在 add_executable 后调用
-
+find_package(nlohmann_json 3.11.3 CONFIG QUIET)
 if(NOT nlohmann_json_FOUND)
-    # 检查本地离线文件
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/json/single_include/nlohmann/json.hpp")
-        message(STATUS "使用本地 nlohmann-json 头文件")
-        add_library(json INTERFACE)
-        target_include_directories(json INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/external/json/single_include)
-        add_library(nlohmann_json::nlohmann_json ALIAS json)
+        message(STATUS "Using vendored nlohmann-json header")
+        add_library(reuperf_json INTERFACE)
+        target_include_directories(reuperf_json INTERFACE
+            "${CMAKE_CURRENT_SOURCE_DIR}/external/json/single_include")
+        add_library(nlohmann_json::nlohmann_json ALIAS reuperf_json)
     else()
-        # 回退到 FetchContent 从 GitHub 下载
-        message(STATUS "未找到本地 nlohmann-json，尝试从 GitHub 下载...")
+        message(STATUS "nlohmann-json not installed; fetching pinned v3.11.3 source")
         include(FetchContent)
         FetchContent_Declare(
-            json
+            nlohmann_json
             GIT_REPOSITORY https://github.com/nlohmann/json.git
             GIT_TAG v3.11.3
             GIT_SHALLOW TRUE
         )
-        FetchContent_MakeAvailable(json)
+        FetchContent_MakeAvailable(nlohmann_json)
     endif()
 endif()
 
-add_executable(thread_scheduler
-    main.cpp
-)
+add_executable(thread_scheduler main.cpp)
 
-target_include_directories(thread_scheduler PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-
-# 传递宏给编译器（在目标创建后）
+target_compile_features(thread_scheduler PRIVATE cxx_std_17)
+set_target_properties(thread_scheduler PROPERTIES CXX_EXTENSIONS OFF)
+target_compile_options(thread_scheduler PRIVATE -Wall -Wextra ${REUPERF_COMPILE_OPTIONS})
+target_link_options(thread_scheduler PRIVATE ${REUPERF_LINK_OPTIONS})
+target_include_directories(thread_scheduler PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(thread_scheduler PRIVATE USE_CAPABILITY_STUB=1)
-
-target_link_libraries(thread_scheduler PRIVATE
-    nlohmann_json::nlohmann_json
-)
+target_link_libraries(thread_scheduler PRIVATE nlohmann_json::nlohmann_json)
 
 install(TARGETS thread_scheduler DESTINATION bin)

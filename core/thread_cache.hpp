@@ -2,8 +2,10 @@
 #define THREAD_CACHE_HPP
 
 #include <cstdint>
-#include <optional>
+#include <map>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -24,13 +26,22 @@ struct ThreadBaseline {
     bool has_cpuctl_path = false;
 };
 
+struct StoredThreadBaseline {
+    int pid;
+    int tid;
+    uint64_t process_start_time;
+    ThreadBaseline baseline;
+};
+
 struct ThreadCacheEntry {
     int pid;
     int tid;
+    uint64_t process_start_time;
     std::string thread_name;
+    std::string cmdline;
     ProcessState actual_state;
     MatchResult result;
-    MatchResult applied_result;
+    std::optional<MatchResult> applied_result;
     std::string cpuset_base;
     std::string cpuctl_base;
     std::optional<ThreadBaseline> baseline;
@@ -46,53 +57,56 @@ struct CacheKeyHash {
 
 class ThreadCache {
 public:
-    std::optional<ThreadCacheEntry> lookup(int pid, int tid, const std::string& thread_name,
+    std::optional<ThreadCacheEntry> lookup(int pid, int tid, uint64_t process_start_time,
+                                           const std::string& thread_name, const std::string& cmdline,
                                            ProcessState actual_state) {
         std::lock_guard<std::mutex> lock(mutex_);
-        const auto key = std::make_pair(pid, tid);
-        const auto it = cache_.find(key);
-        if (it == cache_.end()) {
+        const auto it = cache_.find(std::make_pair(pid, tid));
+        if (it == cache_.end() || it->second.process_start_time != process_start_time) {
             return std::nullopt;
         }
-        if (it->second.thread_name == thread_name && it->second.actual_state == actual_state) {
+        if (it->second.thread_name == thread_name && it->second.cmdline == cmdline
+            && it->second.actual_state == actual_state) {
             return it->second;
         }
         return std::nullopt;
     }
 
-    void update(int pid, int tid, const std::string& thread_name,
-                ProcessState actual_state, const MatchResult& result,
+    void update(int pid, int tid, uint64_t process_start_time, const std::string& thread_name,
+                const std::string& cmdline, ProcessState actual_state, const MatchResult& result,
                 const std::string& cpuset_base, const std::string& cpuctl_base) {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto key = std::make_pair(pid, tid);
         const auto it = cache_.find(key);
-        if (it != cache_.end()) {
+        if (it != cache_.end() && it->second.process_start_time == process_start_time) {
             it->second.thread_name = thread_name;
+            it->second.cmdline = cmdline;
             it->second.actual_state = actual_state;
             it->second.result = result;
             it->second.cpuset_base = cpuset_base;
             it->second.cpuctl_base = cpuctl_base;
             return;
         }
-        cache_.emplace(key, ThreadCacheEntry{
-            pid, tid, thread_name, actual_state, result, result, cpuset_base, cpuctl_base, std::nullopt});
+        cache_[key] = ThreadCacheEntry{pid, tid, process_start_time, thread_name, cmdline,
+            actual_state, result, std::nullopt, cpuset_base, cpuctl_base, std::nullopt};
     }
 
     std::optional<MatchResult> get_applied_result(int pid, int tid) const {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto it = cache_.find(std::make_pair(pid, tid));
-        if (it != cache_.end()) {
-            return it->second.applied_result;
-        }
-        return std::nullopt;
+        return it == cache_.end() ? std::nullopt : it->second.applied_result;
     }
 
     void update_applied_result(int pid, int tid, const MatchResult& result) {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto it = cache_.find(std::make_pair(pid, tid));
-        if (it != cache_.end()) {
-            it->second.applied_result = result;
-        }
+        if (it != cache_.end()) it->second.applied_result = result;
+    }
+
+    void clear_applied_result(int pid, int tid) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = cache_.find(std::make_pair(pid, tid));
+        if (it != cache_.end()) it->second.applied_result.reset();
     }
 
     bool has_baseline(int pid, int tid) const {
@@ -104,43 +118,95 @@ public:
     void set_baseline(int pid, int tid, ThreadBaseline baseline) {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto it = cache_.find(std::make_pair(pid, tid));
-        if (it != cache_.end() && !it->second.baseline.has_value()) {
+        if (it == cache_.end()) return;
+        if (!it->second.baseline) {
             it->second.baseline = std::move(baseline);
+            return;
+        }
+        auto& existing = *it->second.baseline;
+        if (!existing.has_affinity && baseline.has_affinity) {
+            existing.affinity = std::move(baseline.affinity);
+            existing.has_affinity = true;
+        }
+        if (!existing.has_scheduler && baseline.has_scheduler) {
+            existing.scheduler_policy = baseline.scheduler_policy;
+            existing.scheduler_priority = baseline.scheduler_priority;
+            existing.nice = baseline.nice;
+            existing.has_scheduler = true;
+        }
+        if (!existing.has_cpuset_path && baseline.has_cpuset_path) {
+            existing.cpuset_path = std::move(baseline.cpuset_path);
+            existing.has_cpuset_path = true;
+        }
+        if (!existing.has_cpuctl_path && baseline.has_cpuctl_path) {
+            existing.cpuctl_path = std::move(baseline.cpuctl_path);
+            existing.has_cpuctl_path = true;
         }
     }
 
-    std::optional<ThreadBaseline> take_baseline(int pid, int tid) {
+    std::optional<ThreadBaseline> get_baseline(int pid, int tid) const {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto it = cache_.find(std::make_pair(pid, tid));
-        if (it == cache_.end() || !it->second.baseline.has_value()) {
-            return std::nullopt;
-        }
-        auto baseline = std::move(it->second.baseline);
-        it->second.baseline.reset();
-        return baseline;
+        if (it == cache_.end()) return std::nullopt;
+        return it->second.baseline;
     }
 
-    std::vector<std::pair<std::pair<int, int>, ThreadBaseline>> take_all_baselines() {
+    void clear_baseline(int pid, int tid) {
         std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<std::pair<std::pair<int, int>, ThreadBaseline>> baselines;
+        const auto it = cache_.find(std::make_pair(pid, tid));
+        if (it != cache_.end()) it->second.baseline.reset();
+    }
+
+    std::vector<StoredThreadBaseline> get_all_baselines() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<StoredThreadBaseline> baselines;
         baselines.reserve(cache_.size());
-        for (auto& [key, entry] : cache_) {
-            if (entry.baseline.has_value()) {
-                baselines.emplace_back(key, std::move(*entry.baseline));
-                entry.baseline.reset();
+        for (const auto& [key, entry] : cache_) {
+            if (entry.baseline) {
+                baselines.push_back({entry.pid, entry.tid, entry.process_start_time, *entry.baseline});
             }
         }
         return baselines;
     }
 
-    void reset_for_pid(int pid) {
+    void retain_live_threads(const std::map<int, uint64_t>& live_processes,
+                             const std::set<std::pair<int, int>>& live_threads) {
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto it = cache_.begin(); it != cache_.end();) {
-            if (it->first.first == pid) {
+            const auto process = live_processes.find(it->second.pid);
+            if (process == live_processes.end() || process->second != it->second.process_start_time
+                || live_threads.count(it->first) == 0) {
                 it = cache_.erase(it);
             } else {
                 ++it;
             }
+        }
+    }
+
+    void clear_scheduling_state_preserving_baselines() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto it = cache_.begin(); it != cache_.end();) {
+            if (!it->second.baseline) {
+                it = cache_.erase(it);
+                continue;
+            }
+            it->second.thread_name.clear();
+            it->second.cmdline.clear();
+            it->second.applied_result.reset();
+            ++it;
+        }
+    }
+
+    void erase_thread(int pid, int tid) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cache_.erase(std::make_pair(pid, tid));
+    }
+
+    void reset_for_pid(int pid) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto it = cache_.begin(); it != cache_.end();) {
+            if (it->first.first == pid) it = cache_.erase(it);
+            else ++it;
         }
     }
 
