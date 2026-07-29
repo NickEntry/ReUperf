@@ -42,9 +42,10 @@ public:
                 it->second.actual_state == actual_state) {
                 return it->second;
             }
-            it->second.thread_name = thread_name;
-            it->second.actual_state = actual_state;
-            return it->second;
+            // thread_name or actual_state changed → cached MatchResult is stale
+            // (effective_state / cpumask_name / affinity_class resolution may differ).
+            // Return nullopt to force re-match with new state.
+            return std::nullopt;
         }
         return std::nullopt;
     }

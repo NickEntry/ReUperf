@@ -5,6 +5,7 @@
 #include <string>
 #include <sstream>
 #include <algorithm>
+#include <exception>
 #include <sched.h>
 #include <cstring>
 #include <dirent.h>
@@ -99,40 +100,49 @@ public:
                 size_t pos = line.find(':');
                 if (pos == std::string::npos) continue;
                 
-                std::string value = line.substr(pos + 1);
-                size_t start = 0;
-                while (start < value.size() && (value[start] == ' ' || value[start] == '\t')) {
-                    start++;
-                }
-                
+                const std::string value = line.substr(pos + 1);
                 std::vector<int> cpus;
                 size_t i = 0;
-                while (i < value.size()) {
-                    while (i < value.size() && (value[i] == ' ' || value[i] == '\t')) {
-                        i++;
-                    }
-                    if (i >= value.size()) break;
-                    
-                    size_t dash_pos = value.find('-', i);
-                    size_t comma_pos = value.find(',', i);
-                    size_t end_pos = (comma_pos == std::string::npos) ? value.size() : comma_pos;
-                    
-                    if (dash_pos != std::string::npos && dash_pos > i && dash_pos < end_pos) {
-                        int start_cpu = std::stoi(value.substr(i, dash_pos - i));
-                        int end_cpu = std::stoi(value.substr(dash_pos + 1, end_pos - dash_pos - 1));
-                        for (int cpu = start_cpu; cpu <= end_cpu; cpu++) {
+                try {
+                    while (i < value.size()) {
+                        while (i < value.size() && (value[i] == ' ' || value[i] == '\t')) {
+                            ++i;
+                        }
+                        if (i >= value.size()) {
+                            break;
+                        }
+
+                        const size_t comma_pos = value.find(',', i);
+                        const size_t end_pos = (comma_pos == std::string::npos)
+                            ? value.size() : comma_pos;
+                        const size_t dash_pos = value.find('-', i);
+
+                        if (dash_pos != std::string::npos && dash_pos > i && dash_pos < end_pos) {
+                            const int start_cpu = std::stoi(value.substr(i, dash_pos - i));
+                            const int end_cpu = std::stoi(value.substr(
+                                dash_pos + 1, end_pos - dash_pos - 1));
+                            if (start_cpu < 0 || end_cpu < start_cpu || end_cpu >= CPU_SETSIZE) {
+                                LOG_W("CpuMask", "Invalid CPU range in " + status_path + ": " + value);
+                                return {};
+                            }
+                            for (int cpu = start_cpu; cpu <= end_cpu; ++cpu) {
+                                cpus.push_back(cpu);
+                            }
+                        } else {
+                            const int cpu = std::stoi(value.substr(i, end_pos - i));
+                            if (cpu < 0 || cpu >= CPU_SETSIZE) {
+                                LOG_W("CpuMask", "Invalid CPU index in " + status_path + ": " + value);
+                                return {};
+                            }
                             cpus.push_back(cpu);
                         }
-                        i = end_pos;
-                    } else {
-                        int cpu = std::stoi(value.substr(i, end_pos - i));
-                        cpus.push_back(cpu);
-                        i = end_pos;
+
+                        i = (comma_pos == std::string::npos) ? end_pos : comma_pos + 1;
                     }
-                    
-                    if (comma_pos != std::string::npos) {
-                        i = comma_pos + 1;
-                    }
+                } catch (const std::exception& e) {
+                    LOG_W("CpuMask", "Invalid Cpus_allowed_list in " + status_path
+                          + ": " + std::string(e.what()));
+                    return {};
                 }
                 return cpus;
             }

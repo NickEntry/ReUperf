@@ -5,6 +5,7 @@
 #include <csignal>
 #include <set>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #if defined(__linux__) && !defined(USE_CAPABILITY_STUB)
     #include <unistd.h>
@@ -28,6 +29,7 @@
     inline int cap_get_flag(cap_t*, int, cap_flag_value_t, cap_flag_value_t*) { return 0; }
     #endif
 #include <memory>
+#include <mutex>
 #include <ctime>
 #include <regex>
 
@@ -156,7 +158,9 @@ public:
         if (len > 0) {
             for (ssize_t i = 0; i < len; ) {
                 struct inotify_event* event = reinterpret_cast<struct inotify_event*>(&buf[i]);
-                if (event->len > 0 && watch_basename_.compare(0, std::string::npos, event->name, event->len) == 0) {
+                if (event->len > 0 && watch_basename_.compare(
+                        0, std::string::npos, event->name,
+                        strnlen(event->name, event->len)) == 0) {
                     if (event->mask & IN_MODIFY) {
                         LOG_D("ConfigFileWatcher", "Config file modified");
                         return config_changed_.exchange(true, std::memory_order_acq_rel);
@@ -451,6 +455,11 @@ int main(int argc, char* argv[]) {
     
     LOG_I("Main", "Initial scan...");
     
+    // Serializes access to worker ownership and the scheduler objects they reference.
+    // EventRouter invokes its callback on a separate thread while the main thread
+    // may rebuild these objects during a configuration reload.
+    std::mutex scheduler_state_mutex;
+
     std::vector<std::unique_ptr<ScanWorker>> workers;
     workers.push_back(std::make_unique<ScanWorker>("ScanWorker1"));
     workers.push_back(std::make_unique<ScanWorker>("ScanWorker2"));
@@ -495,6 +504,9 @@ int main(int argc, char* argv[]) {
     });
     
     g_event_router->start([&](const std::set<int>& new_pids, const std::set<int>& dead_pids) {
+        // The callback runs on EventRouter's thread. Hold the same lock used by
+        // configuration reload before accessing workers or scheduler objects.
+        std::lock_guard<std::mutex> lock(scheduler_state_mutex);
         (void)dead_pids;
         for (int pid : new_pids) {
             if (pid > 0) {
@@ -582,6 +594,11 @@ int main(int argc, char* argv[]) {
                         LOG_E("Main", "Cgroup initialization failed");
                     }
                     
+                    // EventRouter can dispatch concurrently on its own thread.
+                    // Keep worker ownership and scheduler-object replacement atomic
+                    // with respect to that callback during reload.
+                    std::lock_guard<std::mutex> scheduler_lock(scheduler_state_mutex);
+
                     for (auto& w : workers) {
                         w->stop();
                     }

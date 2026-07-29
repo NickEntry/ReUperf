@@ -5,12 +5,14 @@
 #include <vector>
 #include <sstream>
 #include <cctype>
-#include <cstdio>
 #include <chrono>
-#include <thread>
 #include <csignal>
+#include <cstring>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/wait.h>
 #include <unistd.h>
-#include <errno.h>
+#include <cerrno>
 #include "../utils/logger.hpp"
 
 class LauncherFinder {
@@ -123,65 +125,179 @@ private:
     static constexpr size_t kMaxOutputSize = 64 * 1024;  // 64KB max output
 
     static std::string execute_command(const std::string& cmd, int timeout_ms) {
-        std::string result;
-        
-        FILE* pipe = popen(cmd.c_str(), "r");
-        if (!pipe) {
-            LOG_E("LauncherFinder", "popen failed for: " + cmd);
+        int pipe_fds[2];
+        if (pipe(pipe_fds) != 0) {
+            LOG_E("LauncherFinder", "pipe failed: " + std::string(strerror(errno)));
             return "";
         }
-        
-        auto start = std::chrono::steady_clock::now();
-        
+
+        pid_t child_pid = fork();
+        if (child_pid < 0) {
+            LOG_E("LauncherFinder", "fork failed: " + std::string(strerror(errno)));
+            close(pipe_fds[0]);
+            close(pipe_fds[1]);
+            return "";
+        }
+
+        if (child_pid == 0) {
+            // Isolate the shell and its pipeline children for timeout cleanup.
+            if (setpgid(0, 0) != 0) {
+                _exit(127);
+            }
+            close(pipe_fds[0]);
+            if (dup2(pipe_fds[1], STDOUT_FILENO) < 0) {
+                _exit(127);
+            }
+            close(pipe_fds[1]);
+            execl("/system/bin/sh", "sh", "-c", cmd.c_str(), static_cast<char*>(nullptr));
+            execl("/bin/sh", "sh", "-c", cmd.c_str(), static_cast<char*>(nullptr));
+            _exit(127);
+        }
+
+        // Ensure the child has its own process group before timeout handling.
+        // The child also calls setpgid(), so EACCES/ESRCH here can be ignored.
+        if (setpgid(child_pid, child_pid) != 0 && errno != EACCES && errno != ESRCH) {
+            LOG_W("LauncherFinder", "setpgid failed: " + std::string(strerror(errno)));
+        }
+
+        close(pipe_fds[1]);
+        const int read_fd = pipe_fds[0];
+        const int old_flags = fcntl(read_fd, F_GETFL, 0);
+        if (old_flags < 0 || fcntl(read_fd, F_SETFL, old_flags | O_NONBLOCK) < 0) {
+            LOG_E("LauncherFinder", "fcntl failed: " + std::string(strerror(errno)));
+            close(read_fd);
+            terminate_child(child_pid);
+            return "";
+        }
+
+        std::string result;
+        bool timed_out = false;
+        bool output_too_large = false;
+        bool io_failed = false;
+        bool pipe_closed = false;
+        const auto deadline = std::chrono::steady_clock::now()
+            + std::chrono::milliseconds(timeout_ms);
         char buffer[4096];
-        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            if (result.size() + strlen(buffer) > kMaxOutputSize) {
-                LOG_W("LauncherFinder", "Command output exceeds " + std::to_string(kMaxOutputSize) + " bytes, truncating");
+
+        while (!pipe_closed) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                timed_out = true;
                 break;
             }
-            result += buffer;
-            
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start).count();
-            if (elapsed > timeout_ms) {
-                LOG_W("LauncherFinder", "Command timed out after "
-                      + std::to_string(timeout_ms) + "ms, killing");
-                kill_child(pipe);
-                return "";
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+            struct pollfd pfd{read_fd, POLLIN | POLLHUP, 0};
+            const int poll_result = poll(&pfd, 1, static_cast<int>(remaining));
+            if (poll_result == 0) {
+                timed_out = true;
+                break;
+            }
+            if (poll_result < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                LOG_E("LauncherFinder", "poll failed: " + std::string(strerror(errno)));
+                io_failed = true;
+                break;
+            }
+
+            while (true) {
+                const ssize_t bytes_read = read(read_fd, buffer, sizeof(buffer));
+                if (bytes_read > 0) {
+                    if (result.size() + static_cast<size_t>(bytes_read) > kMaxOutputSize) {
+                        output_too_large = true;
+                        break;
+                    }
+                    result.append(buffer, static_cast<size_t>(bytes_read));
+                    continue;
+                }
+                if (bytes_read == 0) {
+                    pipe_closed = true;
+                    break;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                }
+                if (errno == EINTR) {
+                    continue;
+                }
+                LOG_E("LauncherFinder", "read failed: " + std::string(strerror(errno)));
+                pipe_closed = true;
+                break;
+            }
+            if (output_too_large) {
+                break;
             }
         }
-        
-        int exit_status = pclose(pipe);
-        if (exit_status != 0) {
+
+        close(read_fd);
+        if (timed_out || output_too_large || io_failed) {
+            if (timed_out) {
+                LOG_W("LauncherFinder", "Command timed out after "
+                      + std::to_string(timeout_ms) + "ms, killing");
+            } else if (output_too_large) {
+                LOG_W("LauncherFinder", "Command output exceeds "
+                      + std::to_string(kMaxOutputSize) + " bytes, terminating");
+            } else {
+                LOG_W("LauncherFinder", "Command I/O failed, terminating");
+            }
+            terminate_child(child_pid);
+            return "";
+        }
+
+        int exit_status = 0;
+        while (true) {
+            const pid_t wait_result = waitpid(child_pid, &exit_status, WNOHANG);
+            if (wait_result == child_pid) {
+                break;
+            }
+            if (wait_result < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                LOG_E("LauncherFinder", "waitpid failed: " + std::string(strerror(errno)));
+                return "";
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                LOG_W("LauncherFinder", "Command timed out after "
+                      + std::to_string(timeout_ms) + "ms while waiting, killing");
+                terminate_child(child_pid);
+                return "";
+            }
+            usleep(10'000);
+        }
+        if (!WIFEXITED(exit_status) || WEXITSTATUS(exit_status) != 0) {
             LOG_W("LauncherFinder", "Command exited with status: " + std::to_string(exit_status));
         }
-        
+
         while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
             result.pop_back();
         }
-        
         return result;
     }
-    
-    static void kill_child(FILE* pipe) {
-        if (!pipe) return;
-        int fd = fileno(pipe);
-        // 尝试获取子进程组ID
-        pid_t pgid = tcgetpgrp(fd);
-        if (pgid > 0) {
-            // 终止整个进程组，忽略 ESRCH（进程已退出）
-            if (kill(-pgid, SIGTERM) != 0 && errno != ESRCH) {
-                LOG_W("LauncherFinder", "kill SIGTERM failed: " + std::string(strerror(errno)));
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            if (kill(-pgid, SIGKILL) != 0 && errno != ESRCH) {
-                LOG_W("LauncherFinder", "kill SIGKILL failed: " + std::string(strerror(errno)));
-            }
-        } else if (pgid == -1) {
-            LOG_W("LauncherFinder", "tcgetpgrp failed: " + std::string(strerror(errno)));
+
+    static void terminate_child(pid_t child_pid) {
+        if (kill(-child_pid, SIGTERM) != 0 && errno != ESRCH) {
+            LOG_W("LauncherFinder", "kill SIGTERM failed: " + std::string(strerror(errno)));
         }
-        // pclose 会等待子进程结束
-        pclose(pipe);
+
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            const pid_t wait_result = waitpid(child_pid, nullptr, WNOHANG);
+            if (wait_result == child_pid || (wait_result < 0 && errno == ECHILD)) {
+                return;
+            }
+            if (wait_result < 0 && errno != EINTR) {
+                LOG_W("LauncherFinder", "waitpid failed: " + std::string(strerror(errno)));
+                return;
+            }
+            usleep(10'000);
+        }
+
+        if (kill(-child_pid, SIGKILL) != 0 && errno != ESRCH) {
+            LOG_W("LauncherFinder", "kill SIGKILL failed: " + std::string(strerror(errno)));
+        }
+        while (waitpid(child_pid, nullptr, 0) < 0 && errno == EINTR) {
+        }
     }
 };
 

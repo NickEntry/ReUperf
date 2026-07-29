@@ -40,8 +40,10 @@ private:
             LOG_W("CpuctlSetter", "cpuctl group not exists: " + group_path);
             return false;
         }
-        FileUtils::write_cgroup_procs("/dev/cpuctl/ReUperf", tid);
-        if (!FileUtils::write_cgroup_procs(group_path, tid)) {
+        // Write to tasks (not cgroup.procs) for per-thread migration.
+        // Using cgroup.procs would move the entire process, defeating
+        // per-thread A{n} subgroup assignment.
+        if (!FileUtils::write_cgroup_tasks(group_path, tid)) {
             LOG_W("CpuctlSetter", "Failed to move tid " + std::to_string(tid) + " to " + group_path);
             return false;
         }

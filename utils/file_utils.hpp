@@ -1,6 +1,7 @@
 #ifndef FILE_UTILS_HPP
 #define FILE_UTILS_HPP
 
+#include <cstdint>
 #include <string>
 #include <fstream>
 #include <sstream>
@@ -448,6 +449,13 @@ inline std::vector<int> read_cgroup_procs(const std::string& path) {
 
 inline bool write_cgroup_procs(const std::string& path, int tid) {
     return write_file(path + "/cgroup.procs", std::to_string(tid));
+}
+
+// Write a single thread (TID) to a cgroup's tasks file.
+// Unlike cgroup.procs (which moves the whole process), tasks moves only
+// the specified thread, enabling per-thread cgroup grouping.
+inline bool write_cgroup_tasks(const std::string& path, int tid) {
+    return write_file(path + "/tasks", std::to_string(tid));
 }
 
 // 进程信息缓存

@@ -5,6 +5,7 @@
 #include <thread>
 #include <atomic>
 #include <functional>
+#include <cstring>
 #include <cerrno>
 #include <sys/inotify.h>
 #include <unistd.h>
@@ -120,7 +121,9 @@ private:
                 struct inotify_event* event = reinterpret_cast<struct inotify_event*>(&buf[i]);
                 
                 if (event->len > 0) {
-                    std::string name(event->name, event->len);
+                    // event->len includes the null terminator (per inotify(7)).
+                    // Use strnlen to get the actual name length without trailing nulls.
+                    std::string name(event->name, strnlen(event->name, event->len));
                     
                     if (event->mask & IN_CREATE) {
                         if (name.find_first_not_of("0123456789") == std::string::npos) {

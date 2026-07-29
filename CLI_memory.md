@@ -1,122 +1,61 @@
 # ReUperf Thread Scheduler Memory
 
-## Project Overview
+## 项目概览
 
-Android thread scheduler based on uperf configuration format. Uses sched_setaffinity, cgroup cpuset/cpuctl, and sched_setscheduler to manage thread CPU affinity, scheduling priority, and resource limits.
+ReUperf 是基于 uperf JSON 配置格式的 Android 线程调度器。它通过 `sched_setaffinity`、`sched_setscheduler`、cpuset 和 cpuctl cgroup，为匹配的线程应用 CPU 亲和性、调度优先级和可选资源限制。
 
-## File Structure
+## 关键路径
 
-```
-thread_scheduler/
-├── main.cpp                          # Entry point
-├── CMakeLists.txt                    # CMake build config
-├── config.json                       # Example config file
-├── config/
-│   ├── config_parser.hpp             # JSON parsing (nlohmann/json)
-│   └── config_types.hpp              # Data structures
-├── core/
-│   ├── cgroup_init.hpp               # Create cpuset/cpuctl directories
-│   ├── cpuset_monitor.hpp            # inotify monitor for cgroup changes
-│   ├── launcher_finder.hpp           # dumpsys to find launcher package
-│   ├── process_scanner.hpp           # /proc scanner
-│   ├── scan_worker.hpp               # Async dispatch workers (4 threads)
-│   ├── thread_cache.hpp              # Process/thread result cache
-│   └── thread_matcher.hpp            # Regex matching + macro expansion
-├── scheduler/
-│   ├── cpuctl_setter.hpp              # uclamp.max / cpu.shares
-│   ├── cpuset_setter.hpp              # CPU affinity + cpuset cgroup
-│   └── priority_setter.hpp           # sched_setscheduler (SCHED_FIFO/NORMAL/BATCH/IDLE)
-└── utils/
-    ├── cpu_mask.hpp                  # cpu_set_t operations
-    ├── file_utils.hpp                # File I/O, /proc parsing
-    └── logger.hpp                    # Configurable logging
-```
+| 项目 | 路径 |
+|---|---|
+| 配置文件 | `/data/adb/ReUperf/ReUperf.json` |
+| 日志文件 | `/data/adb/ReUperf/ReUperf.log` |
+| 守护进程 | `/data/adb/ReUperf/thread_scheduler` |
+| Magisk 模板 | `module_template/` |
+| 自动打包脚本 | `scripts/package_module.sh` |
 
-## Default Paths
+## 构建与模块产物
 
-| Item | Path |
-|------|------|
-| Config file | `/data/adb/ReUperf/ReUperf.json` |
-| Log file | `/data/adb/ReUperf/ReUperf.log` |
-| Data directory | `/data/adb/ReUperf` (0755) |
+- `build.sh`：动态链接构建；成功后自动生成 Magisk 模块 zip。
+- `build_static.sh`：静态链接构建；成功后自动生成 Magisk 模块 zip。
+- 模块输出目录默认为 `out/`，文件名包含 ABI、链接类型和版本时间。
+- 动态模块会打包同 ABI 的 `libc++_shared.so`；静态模块不包含该库。
+- GitHub Actions 构建 4 个 ABI：`arm64-v8a`、`armeabi-v7a`、`x86_64`、`x86`，每个 ABI 产出 dynamic/static 两种模块。
 
-## Build
+## 调度模型
 
-```bash
-cd thread_scheduler
-mkdir build && cd build
-cmake ..
-make
-```
+### 进程状态
 
-## Run
+- **BG**：不在 foreground/top-app cpuset 的进程。
+- **FG**：位于 `foreground` cpuset 的进程。
+- **TOP**：位于 `top-app` cpuset 的进程。
+- `pinned=true` 会将规则有效状态固定为 TOP；`topfore=true` 会在进程处于 FG 时提升为 TOP。
 
-```bash
-./thread_scheduler                    # Use default config path
-./thread_scheduler /path/to/config.json  # Custom config
-```
+### 调度循环与事件
 
-## Key Design Decisions
+1. 启动时扫描规则、初始化 cgroup，并启动 4 个 `ScanWorker`。
+2. 高频循环按 `highspeed_sched_ms` 调度缓存中的 `pinned`/`topfore` 进程，并扫描当前 FG/TOP 进程。
+3. 低频循环按 `refresh_interval_ms` 刷新规则缓存、清理死亡 PID，并执行完整调度扫描。
+4. `ProcMonitor` 通过 inotify 监控 `/proc` 的 PID 创建和删除；事件经 `EventRouter` 合并后触发增量 dispatch 和完整重扫。
+5. `ConfigFileWatcher` 监控配置所在目录的文件修改；检测到有效更新后会重建 matcher、scanner 和 worker。重载与事件调度通过互斥保护，避免旧 worker 被并发访问。
 
-### Process States
-- **bg**: Background (not in foreground/top-app cpuset)
-- **fg**: Foreground (in foreground cpuset)
-- **top**: Top-app (in top-app cpuset)
+## cgroup 结构与线程迁移
 
-### State Modifiers
-- `pinned=true`: Always treat as TOP state
-- `topfore=true`: Treat as TOP when in FG state
-
-### Priority Values (from uperf)
-| Value | Meaning |
-|-------|---------|
-| 0 | Skip scheduling policy |
-| 1-98 | SCHED_FIFO with priority |
-| 100-139 | SCHED_NORMAL with nice (value-120) |
-| -1 | SCHED_NORMAL |
-| -2 | SCHED_BATCH |
-| -3 | SCHED_IDLE |
-
-### Special Regex Macros
-- `/HOME_PACKAGE/`: Replaced with launcher package name
-- `/MAIN_THREAD/`: Replaced with process name (main thread name)
-
-### Cgroup Structure Created
-
-**cpuset** (for CPU affinity):
-```
+```text
 /dev/cpuset/ReUperf_{cpumask_name}
+/dev/cpuctl/ReUperf/{rule_name}/A{thread_rule_index + 1}
 ```
 
-**cpuctl** (for resource limits):
-```
-/dev/cpuctl/ReUperf/{rule_name}/A{index}
-```
+- cpuset 用于将线程放入与 cpumask 对应的组；同时会调用 `sched_setaffinity`。
+- 当线程规则的 `enable_limit=true` 时，会创建对应的 cpuctl 子组，并按需设置 `cpu.uclamp.max` 与 `cpu.shares`。
+- 调度器将 **TID 直接写入最终目标 cgroup 的 `tasks` 文件**，从而保持线程级迁移；不会通过 `cgroup.procs` 迁移整个进程。
 
-**Note**: When moving threads to cgroup, tasks are first written to the parent group:
-- cpuset: `/dev/cpuset/ReUperf_{cpumask}/tasks` → `/dev/cpuset/ReUperf_{cpumask}/tasks`
-- cpuctl: `/dev/cpuctl/ReUperf/tasks` → `/dev/cpuctl/ReUperf/{rule_name}/A{index}/tasks`
+## 兼容性
 
-## Main Loop
+- 使用 C++17 和 nlohmann/json。
+- 市售 Android 设备即使底层采用 unified cgroup v2，通常仍会暴露 `/dev/cpuset`、`/dev/cpuctl` 等 Android 兼容路径；底层 cgroup 版本本身不是功能可用性的判断依据。
+- cgroup 限制功能以实际暴露且可写的控制文件为准，包括目标组的 `tasks`、`cpu.shares` 和可能的 `cpu.uclamp.max`；亲和性和优先级能力仍取决于内核接口、SELinux 和进程权限。
 
-1. Parse config, find launcher package
-2. Initialize cgroup directories
-3. Scan all processes, dispatch to ScanWorker threads (async)
-4. Start inotify monitor for cpuset changes
-5. Loop: refresh fg/top processes every `refresh_interval_ms`
+## 配置
 
-### Architecture
-
-- **Main Thread**: Monitors cpuset changes, dispatches tasks
-- **ScanWorker Threads** (4): Async apply cpuset/cpuctl/priority settings
-- **ProcMonitor Thread**: inotify watch for `/dev/cpuset` changes
-
-## Dependencies
-
-- C++17
-- nlohmann/json (fetched by CMake)
-- Linux/Android system headers (sched.h, sys/inotify.h, etc.)
-
-## Config File Format
-
-Compatible with uperf v3 JSON format. See config.md for details.
+配置兼容 uperf v3 的 `modules.sched` 结构。字段、优先级语义和示例见 [config.md](config.md)。

@@ -236,7 +236,8 @@ private:
         MatchResult result;
         result.effective_state = actual_state;
 
-        std::string cache_key = proc_name + "#|#" + thread_name + "#|#" + cmdline;
+        std::string cache_key = proc_name + "#|#" + thread_name + "#|#" + cmdline
+            + "#|#" + std::to_string(static_cast<int>(actual_state));
         
         if (proc_name == "[dead]") {
             size_t bucket = get_cache_bucket(cache_key);

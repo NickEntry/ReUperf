@@ -84,7 +84,7 @@ public:
         constexpr int kRetryIntervalMs = 10;
         
         for (int retry = 0; retry < kMaxRetries; ++retry) {
-            if (FileUtils::write_file(path + "/cgroup.procs", std::to_string(tid))) {
+            if (FileUtils::write_file(path + "/tasks", std::to_string(tid))) {
                 LOG_T("CpusetSetter", "Moved tid " + std::to_string(tid) + " to cpuset " + path);
                 return true;
             }

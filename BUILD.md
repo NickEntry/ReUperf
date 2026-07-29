@@ -7,6 +7,8 @@
 | `CMakeLists.txt` | 编译配置（支持 `BUILD_STATIC` 选项） |
 | `build.sh` / `build.bat` | 正常编译脚本（动态链接） |
 | `build_static.sh` / `build_static.bat` | 静态编译脚本（静态链接） |
+| `scripts/package_module.sh` | 将已构建的二进制打包为 Magisk 模块 |
+| `module_template/` | Magisk 模块模板、启动脚本和默认配置 |
 
 ## 前置要求
 
@@ -59,6 +61,7 @@ pkg install ndk-sysroot ndk-multilib-native-static libandroid-support-static
 - 检查并提示安装缺失依赖
 - 使用本地编译器（c++/clang）
 - 使用 lld 链接器（修复 tagged pointers 问题）
+- 在构建成功后调用 `scripts/package_module.sh`，将 Magisk 模块 zip 输出到 `out/`
 
 ### 交叉编译（Linux/Windows）
 
@@ -150,6 +153,30 @@ export TARGET_ARCH=x86
 ```bash
 export API_LEVEL=24  # Android 7.0
 ./build.sh
+```
+
+## Magisk 模块打包
+
+`build.sh` 和 `build_static.sh` 在二进制构建成功后会自动打包模块，默认输出到项目根目录的 `out/`：
+
+```text
+out/ReUperf-{ABI}-{dynamic|static}-{版本时间}.zip
+```
+
+- 支持 ABI：`arm64-v8a`、`armeabi-v7a`、`x86_64`、`x86`。
+- **dynamic** 模块会从 Android NDK 打包同 ABI 的 `libc++_shared.so`；模块启动脚本会设置 `LD_LIBRARY_PATH=/data/adb/ReUperf`。
+- **static** 模块不包含 `libc++_shared.so`。
+- 模块安装和开机服务将二进制放在 `/data/adb/ReUperf/thread_scheduler`。首次安装会复制默认配置到 `/data/adb/ReUperf/ReUperf.json`；之后模块更新会保留用户已修改的配置。
+
+也可以在已有二进制时单独打包：
+
+```bash
+bash scripts/package_module.sh \
+  --binary build/thread_scheduler \
+  --arch arm64-v8a \
+  --type dynamic \
+  --ndk "$NDK" \
+  --output out
 ```
 
 ## 验证编译结果
