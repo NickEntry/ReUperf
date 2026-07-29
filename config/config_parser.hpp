@@ -54,8 +54,9 @@ private:
         }
 
         for (unsigned char c : name) {
-            // Rule names become cgroup directory components. Keep UTF-8 names
-            // usable while excluding path separators and control characters.
+            // This is intentionally a blacklist for cgroup path components, not an
+            // ASCII-only whitelist: UTF-8 names (including Chinese and other languages)
+            // remain valid. Reject only path syntax and control characters.
             if (c < 0x20 || c == 0x7f || c == '/' || c == '\\') {
                 return false;
             }
@@ -107,25 +108,42 @@ private:
             cfg.case_insensitive = sched["case_insensitive"].get<bool>();
         }
 
-        int refresh_interval = 1000;
+        int refresh_interval = 2000;
         if (sched.contains("refresh_interval_ms") && sched["refresh_interval_ms"].is_number_integer()) {
             refresh_interval = sched["refresh_interval_ms"].get<int>();
         }
         if (refresh_interval <= 0) {
-            LOG_W("ConfigParser", "Invalid refresh_interval_ms " + std::to_string(refresh_interval) + ", using default 1000");
-            refresh_interval = 1000;
+            LOG_W("ConfigParser", "Invalid refresh_interval_ms " + std::to_string(refresh_interval) + ", using default 2000");
+            refresh_interval = 2000;
         }
         cfg.refresh_interval_ms = refresh_interval;
 
-        int highspeed = 100;
+        int highspeed = 300;
         if (sched.contains("highspeed_sched_ms") && sched["highspeed_sched_ms"].is_number_integer()) {
             highspeed = sched["highspeed_sched_ms"].get<int>();
         }
         if (highspeed <= 0) {
-            LOG_W("ConfigParser", "Invalid highspeed_sched_ms " + std::to_string(highspeed) + ", using default 100");
-            highspeed = 100;
+            LOG_W("ConfigParser", "Invalid highspeed_sched_ms " + std::to_string(highspeed) + ", using default 300");
+            highspeed = 300;
         }
         cfg.highspeed_sched_ms = highspeed;
+
+        auto parse_bounded_int = [&sched](const char* name, int default_value, int min_value, int max_value) {
+            int value = default_value;
+            if (sched.contains(name) && sched[name].is_number_integer()) {
+                value = sched[name].get<int>();
+            }
+            if (value < min_value || value > max_value) {
+                LOG_W("ConfigParser", "Invalid " + std::string(name) + " " + std::to_string(value)
+                      + ", using default " + std::to_string(default_value));
+                return default_value;
+            }
+            return value;
+        };
+        cfg.top_scan_budget_us = parse_bounded_int("top_scan_budget_us", 4000, 500, 20000);
+        cfg.full_scan_budget_us = parse_bounded_int("full_scan_budget_us", 12000, 1000, 50000);
+        cfg.scan_batch_size = parse_bounded_int("scan_batch_size", 32, 1, 256);
+        cfg.scan_batch_yield_us = parse_bounded_int("scan_batch_yield_us", 0, 0, 1000);
 
         if (sched.contains("log")) {
             const json& log = sched["log"];

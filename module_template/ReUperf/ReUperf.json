@@ -6,8 +6,12 @@
   "modules": {
     "sched": {
       "enable": true,
-      "refresh_interval_ms": 2500,
-      "highspeed_sched_ms": 1000,
+      "refresh_interval_ms": 2000,
+      "highspeed_sched_ms": 300,
+      "top_scan_budget_us": 4000,
+      "full_scan_budget_us": 12000,
+      "scan_batch_size": 32,
+      "scan_batch_yield_us": 0,
       "log": {
         "level": "info",
         "output": "/data/adb/ReUperf/ReUperf.log"

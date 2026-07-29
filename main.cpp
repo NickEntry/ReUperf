@@ -42,7 +42,6 @@
 #include "utils/file_utils.hpp"
 #include "core/cgroup_init.hpp"
 #include "core/launcher_finder.hpp"
-#include "core/process_scanner.hpp"
 #include "core/cpuset_monitor.hpp"
 #include "core/event_router.hpp"
 #include "core/thread_matcher.hpp"
@@ -55,7 +54,6 @@
 namespace {
     volatile std::sig_atomic_t signal_requested = 0;
     std::atomic<bool> running(true);
-    std::atomic<bool> cgroup_changed(false);
     std::atomic<bool> full_rescan_needed(true);
     std::atomic<bool> shutdown_requested(false);
     std::shared_ptr<EventRouter> g_event_router;
@@ -236,38 +234,64 @@ private:
 using PinnedCache = PidCache;
 using TopForeCache = PidCache;
 
+struct ScanBudget {
+    explicit ScanBudget(int budget_us, int batch_size, int batch_yield_us)
+        : deadline(std::chrono::steady_clock::now() + std::chrono::microseconds(budget_us)),
+          batch_size(std::max(batch_size, 1)), batch_yield_us(std::max(batch_yield_us, 0)) {}
+
+    bool exhausted() const {
+        return std::chrono::steady_clock::now() >= deadline;
+    }
+
+    void after_thread_read() {
+        ++thread_reads;
+        if (batch_yield_us > 0 && thread_reads % static_cast<size_t>(batch_size) == 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(batch_yield_us));
+        }
+    }
+
+    std::chrono::steady_clock::time_point deadline;
+    int batch_size;
+    int batch_yield_us;
+    size_t thread_reads = 0;
+};
+
+struct ScanCursor {
+    int pid = 0;
+    int tid = 0;
+};
+
 void scan_and_update_rule_cache(ThreadMatcher& matcher,
                                 std::set<int>& pinned_pids,
                                 std::set<int>& topfore_pids,
+                                std::set<int>& top_app_pids,
+                                std::set<int>& foreground_pids,
                                 std::set<int>& dead_pids) {
-    auto all_pids = FileUtils::list_pids();
-    
+    const auto all_pids = FileUtils::list_pids();
+
     for (int pid : all_pids) {
-        std::string proc_name = FileUtils::get_process_name_from_status(pid);
-        
+        const std::string proc_name = FileUtils::get_process_name_from_status(pid);
         if (proc_name == "[dead]") {
             dead_pids.insert(pid);
             continue;
         }
 
-        std::string cmdline = FileUtils::get_process_cmdline(pid);
-
+        const std::string cmdline = FileUtils::get_process_cmdline(pid);
+        const FileUtils::CgroupState cg_state = FileUtils::get_cgroup_state(pid);
         ProcessState actual_state = ProcessState::BG;
-        FileUtils::CgroupState cg_state = FileUtils::get_cgroup_state(pid);
         if (cg_state == FileUtils::CgroupState::TOP) {
             actual_state = ProcessState::TOP;
+            top_app_pids.insert(pid);
         } else if (cg_state == FileUtils::CgroupState::FG) {
             actual_state = ProcessState::FG;
+            foreground_pids.insert(pid);
         }
 
-        MatchResult result = matcher.match_process_only(proc_name, proc_name, actual_state, pid, cmdline);
-
-        if (!result.matched) continue;
-
-        if (result.matched_rule_name == "Default rule") {
+        const MatchResult result = matcher.match_process_only(
+            proc_name, proc_name, actual_state, pid, cmdline);
+        if (!result.matched || result.matched_rule_name == "Default rule") {
             continue;
         }
-
         if (result.pinned) {
             pinned_pids.insert(pid);
         }
@@ -277,94 +301,92 @@ void scan_and_update_rule_cache(ThreadMatcher& matcher,
     }
 }
 
-inline void dispatch_pids_to_workers(
-                                std::vector<std::unique_ptr<ScanWorker>>& workers,
-                                const std::set<int>& pids,
-                                ProcessState state, const std::string& cpuset_base,
-                                std::set<int>& processed_tids,
-                                bool skip_topapp_cgroup = false) {
-    for (int pid : pids) {
-        int worker_idx = pid % workers.size();
-        
-        std::string proc_name = FileUtils::get_process_name_from_status(pid);
-        if (proc_name == "[dead]") continue;
-
-        std::string cmdline = FileUtils::get_process_cmdline(pid);
-
-        if (skip_topapp_cgroup) {
-            std::string cgroup = FileUtils::get_cgroup_path(pid, "cpuset");
-            if (cgroup.find("top-app") != std::string::npos) continue;
-        }
-
-        auto tids = FileUtils::list_tids(pid);
-        for (int tid : tids) {
-            if (processed_tids.count(tid) > 0) continue;
-
-            std::string thread_name = FileUtils::get_thread_name(pid, tid);
-
-            DispatchTask task;
-            task.pid = pid;
-            task.tid = tid;
-            task.thread_name = thread_name;
-            task.state = state;
-            task.cpuset_base = cpuset_base;
-            task.proc_name = proc_name;
-            task.cmdline = cmdline;
-
-            workers[worker_idx]->enqueue(task);
-
-            processed_tids.insert(tid);
-        }
+inline bool dispatch_pids_to_workers(
+    std::vector<std::unique_ptr<ScanWorker>>& workers,
+    const std::set<int>& pids, ProcessState state, const std::string& cpuset_base,
+    std::set<int>& processed_tids, ScanBudget& budget, ScanCursor& cursor) {
+    if (workers.empty() || pids.empty()) {
+        return false;
     }
-}
 
-inline void dispatch_pinned_to_workers(std::vector<std::unique_ptr<ScanWorker>>& workers,
-                                  const std::set<int>& pids,
-                                  std::set<int>& processed_tids) {
-    static const std::string CPUSET_BASE = "/dev/cpuset";
-    dispatch_pids_to_workers(workers, pids, ProcessState::TOP, CPUSET_BASE, processed_tids, false);
-}
-
-inline void dispatch_topfore_to_workers(std::vector<std::unique_ptr<ScanWorker>>& workers,
-                                   const std::set<int>& pids,
-                                   std::set<int>& processed_tids) {
-    static const std::string CPUSET_BASE = "/dev/cpuset";
-    dispatch_pids_to_workers(workers, pids, ProcessState::FG, CPUSET_BASE, processed_tids, true);
-}
-
-inline void dispatch_fg_top_to_workers(std::vector<std::unique_ptr<ScanWorker>>& workers,
-                                   ProcessScanner& scanner,
-                                   std::set<int>& processed_tids) {
-    auto processes = scanner.scan_fg_top();
-    if (processes.empty()) return;
-
-    static const std::string CPUSET_BASE = "/dev/cpuset";
-
-    for (const auto& info : processes) {
-        int worker_idx = info.pid % workers.size();
-        
-        std::string cmdline = FileUtils::get_process_cmdline(info.pid);
-
-        for (int tid : info.tids) {
-            if (processed_tids.count(tid) > 0) continue;
-            auto it = info.thread_names.find(tid);
-            if (it == info.thread_names.end()) continue;
-            const std::string& thread_name = it->second;
-
-            DispatchTask task;
-            task.pid = info.pid;
-            task.tid = tid;
-            task.thread_name = thread_name;
-            task.state = info.state;
-            task.cpuset_base = CPUSET_BASE;
-            task.proc_name = info.name;
-            task.cmdline = cmdline;
-
-            workers[worker_idx]->enqueue(task);
-
-            processed_tids.insert(tid);
-        }
+    auto pid_it = cursor.pid > 0 ? pids.lower_bound(cursor.pid) : pids.begin();
+    if (pid_it == pids.end()) {
+        pid_it = pids.begin();
     }
+    const int first_pid = *pid_it;
+
+    do {
+        const int pid = *pid_it;
+        const int worker_idx = pid % static_cast<int>(workers.size());
+        const std::string proc_name = FileUtils::get_process_name_from_status(pid);
+        if (proc_name != "[dead]") {
+            const std::string cmdline = FileUtils::get_process_cmdline(pid);
+            const auto tids = FileUtils::list_tids(pid);
+            const int resume_after_tid = cursor.pid == pid ? cursor.tid : 0;
+            for (int tid : tids) {
+                if (tid <= resume_after_tid || processed_tids.count(tid) > 0) {
+                    continue;
+                }
+                if (budget.exhausted()) {
+                    cursor = {pid, tid - 1};
+                    return true;
+                }
+
+                // Do not pre-stat the thread path: opendir/open is authoritative and avoids
+                // an extra syscall plus a TOCTOU race when a thread exits concurrently.
+                const std::string thread_name = FileUtils::get_thread_name(pid, tid);
+                budget.after_thread_read();
+                if (thread_name == "[dead]") {
+                    continue;
+                }
+
+                DispatchTask task{pid, tid, thread_name, state, cpuset_base, proc_name, cmdline};
+                workers[worker_idx]->enqueue(task);
+                processed_tids.insert(tid);
+            }
+        }
+
+        cursor = {pid, 0};
+        ++pid_it;
+        if (pid_it == pids.end()) {
+            pid_it = pids.begin();
+        }
+    } while (*pid_it != first_pid);
+
+    cursor = {0, 0};
+    return false;
+}
+
+inline bool dispatch_pinned_to_workers(std::vector<std::unique_ptr<ScanWorker>>& workers,
+                                       const std::set<int>& pids, std::set<int>& processed_tids,
+                                       ScanBudget& budget, ScanCursor& cursor) {
+    static const std::string CPUSET_BASE = "/dev/cpuset";
+    return dispatch_pids_to_workers(workers, pids, ProcessState::TOP, CPUSET_BASE,
+                                    processed_tids, budget, cursor);
+}
+
+inline bool dispatch_topfore_to_workers(std::vector<std::unique_ptr<ScanWorker>>& workers,
+                                        const std::set<int>& pids, std::set<int>& processed_tids,
+                                        ScanBudget& budget, ScanCursor& cursor) {
+    static const std::string CPUSET_BASE = "/dev/cpuset";
+    return dispatch_pids_to_workers(workers, pids, ProcessState::TOP, CPUSET_BASE,
+                                    processed_tids, budget, cursor);
+}
+
+inline bool dispatch_top_app_to_workers(std::vector<std::unique_ptr<ScanWorker>>& workers,
+                                        const std::set<int>& pids, std::set<int>& processed_tids,
+                                        ScanBudget& budget, ScanCursor& cursor) {
+    static const std::string CPUSET_BASE = "/dev/cpuset";
+    return dispatch_pids_to_workers(workers, pids, ProcessState::TOP, CPUSET_BASE,
+                                    processed_tids, budget, cursor);
+}
+
+inline bool dispatch_foreground_to_workers(std::vector<std::unique_ptr<ScanWorker>>& workers,
+                                           const std::set<int>& pids, std::set<int>& processed_tids,
+                                           ScanBudget& budget, ScanCursor& cursor) {
+    static const std::string CPUSET_BASE = "/dev/cpuset";
+    return dispatch_pids_to_workers(workers, pids, ProcessState::FG, CPUSET_BASE,
+                                    processed_tids, budget, cursor);
 }
 
 void cleanup_dead_pids(ThreadCache& cache, PinnedCache& pinned_cache,
@@ -479,14 +501,15 @@ int main(int argc, char* argv[]) {
     }
     
     auto matcher_ptr = std::make_shared<ThreadMatcher>(config);
-    auto scanner_ptr = std::make_shared<ProcessScanner>();
     auto cpuset_ptr = std::make_shared<CpusetSetter>(*matcher_ptr);
     auto prio_ptr = std::make_shared<PrioritySetter>(*matcher_ptr);
     auto cpuctl_ptr = std::make_shared<CpuctlSetter>();
     auto cache_ptr = std::make_shared<ThreadCache>();
     auto pinned_cache = std::make_unique<PinnedCache>();
     auto topfore_cache = std::make_unique<TopForeCache>();
-    
+    std::set<int> cached_top_app_pids;
+    std::set<int> cached_foreground_pids;
+
     LOG_I("Main", "Initial scan...");
     
     // Serializes access to worker ownership and the scheduler objects they reference.
@@ -509,17 +532,32 @@ int main(int argc, char* argv[]) {
         std::set<int> dead_pids;
         std::set<int> pinned_pids;
         std::set<int> topfore_pids;
-        
-        scan_and_update_rule_cache(*matcher_ptr, pinned_pids, topfore_pids, dead_pids);
+        std::set<int> top_app_pids;
+        std::set<int> foreground_pids;
+
+        scan_and_update_rule_cache(*matcher_ptr, pinned_pids, topfore_pids, top_app_pids,
+                                   foreground_pids, dead_pids);
         pinned_cache->update(pinned_pids);
         topfore_cache->update(topfore_pids);
+        cached_top_app_pids = top_app_pids;
+        cached_foreground_pids = foreground_pids;
         cleanup_dead_pids(*cache_ptr, *pinned_cache, *topfore_cache, dead_pids, pinned_pids, topfore_pids);
-        
+
         std::set<int> processed;
-        dispatch_pinned_to_workers(workers, pinned_pids, processed);
-        dispatch_topfore_to_workers(workers, topfore_pids, processed);
-        dispatch_fg_top_to_workers(workers, *scanner_ptr, processed);
-        
+        ScanBudget initial_budget(config.sched.full_scan_budget_us, config.sched.scan_batch_size,
+                                  config.sched.scan_batch_yield_us);
+        ScanCursor cursor;
+        if (!dispatch_top_app_to_workers(workers, top_app_pids, processed, initial_budget, cursor)
+            && !initial_budget.exhausted()
+            && !dispatch_pinned_to_workers(workers, pinned_pids, processed, initial_budget, cursor)
+            && !initial_budget.exhausted()
+            && !dispatch_topfore_to_workers(workers, topfore_pids, processed, initial_budget, cursor)
+            && !initial_budget.exhausted()) {
+            dispatch_foreground_to_workers(workers, foreground_pids, processed, initial_budget, cursor);
+        }
+        // The initial scan is already a complete calibration; avoid repeating it in the first loop.
+        full_rescan_needed.store(false, std::memory_order_release);
+
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     
@@ -534,7 +572,6 @@ int main(int argc, char* argv[]) {
             LOG_D("Main", "Process exited: " + std::to_string(-pid));
             g_event_router->on_process_exited(-pid);
         }
-        cgroup_changed.store(true, std::memory_order_release);
     });
     
     g_event_router->start([&](const std::set<int>& new_pids, const std::set<int>& dead_pids) {
@@ -545,30 +582,33 @@ int main(int argc, char* argv[]) {
         for (int pid : new_pids) {
             if (pid > 0) {
                 LOG_I("Main", "Incremental dispatch for new pid: " + std::to_string(pid));
-                std::set<int> single_pid = {pid};
+                const std::set<int> single_pid = {pid};
                 std::set<int> processed;
+                ScanBudget budget(config.sched.top_scan_budget_us, config.sched.scan_batch_size,
+                                  config.sched.scan_batch_yield_us);
+                ScanCursor cursor;
 
-                // Quick check: determine which category this new PID belongs to
-                std::string proc_name = FileUtils::get_process_name_from_status(pid);
+                // Only inspect the affected PID. A process event must not trigger a global /proc scan.
+                const std::string proc_name = FileUtils::get_process_name_from_status(pid);
                 if (proc_name == "[dead]") continue;
-                std::string cmdline = FileUtils::get_process_cmdline(pid);
-                FileUtils::CgroupState cg_state = FileUtils::get_cgroup_state(pid);
+                const std::string cmdline = FileUtils::get_process_cmdline(pid);
+                const FileUtils::CgroupState cg_state = FileUtils::get_cgroup_state(pid);
                 ProcessState actual_state = ProcessState::BG;
                 if (cg_state == FileUtils::CgroupState::TOP) {
                     actual_state = ProcessState::TOP;
+                    dispatch_top_app_to_workers(workers, single_pid, processed, budget, cursor);
                 } else if (cg_state == FileUtils::CgroupState::FG) {
                     actual_state = ProcessState::FG;
                 }
-                MatchResult result = matcher_ptr->match_process_only(proc_name, proc_name, actual_state, pid, cmdline);
-
+                const MatchResult result = matcher_ptr->match_process_only(
+                    proc_name, proc_name, actual_state, pid, cmdline);
                 if (result.matched && result.matched_rule_name != "Default rule") {
                     if (result.pinned) {
-                        dispatch_pinned_to_workers(workers, single_pid, processed);
-                    } else if (result.topfore) {
-                        dispatch_topfore_to_workers(workers, single_pid, processed);
+                        dispatch_pinned_to_workers(workers, single_pid, processed, budget, cursor);
+                    } else if (result.topfore && actual_state == ProcessState::FG) {
+                        dispatch_topfore_to_workers(workers, single_pid, processed, budget, cursor);
                     }
                 }
-                dispatch_fg_top_to_workers(workers, *scanner_ptr, processed);
             }
         }
         for (int pid : dead_pids) {
@@ -584,15 +624,18 @@ int main(int argc, char* argv[]) {
     uint64_t last_config_hash = compute_config_hash(config_path);
     LOG_I("Main", "Initial config hash: " + std::to_string(last_config_hash));
     
-    int highspeed_ms = std::max(config.sched.highspeed_sched_ms > 0 ? config.sched.highspeed_sched_ms : 100, 1);
-    int refresh_ms = std::max(config.sched.refresh_interval_ms > 0 ? config.sched.refresh_interval_ms : 1000, highspeed_ms);
-    int highspeed_loops = refresh_ms / highspeed_ms;
-    
-    LOG_I("Main", "Dual-loop scheduler: highspeed=" + std::to_string(highspeed_ms) 
-          + "ms, refresh=" + std::to_string(refresh_ms) 
-          + "ms (" + std::to_string(highspeed_loops) + " cycles)");
-    
-    int loop_counter = 0;
+    int highspeed_ms = std::max(config.sched.highspeed_sched_ms, 1);
+    int refresh_ms = std::max(config.sched.refresh_interval_ms, highspeed_ms);
+    auto next_full_scan = std::chrono::steady_clock::now() + std::chrono::milliseconds(refresh_ms);
+    ScanCursor top_cursor;
+    ScanCursor pinned_cursor;
+    ScanCursor topfore_cursor;
+    ScanCursor foreground_cursor;
+
+    LOG_I("Main", "Scheduler: top=" + std::to_string(highspeed_ms)
+          + "ms, full=" + std::to_string(refresh_ms)
+          + "ms, top_budget=" + std::to_string(config.sched.top_scan_budget_us)
+          + "us, full_budget=" + std::to_string(config.sched.full_scan_budget_us) + "us");
     
     while (running.load(std::memory_order_acquire)) {
         if (signal_requested != 0) {
@@ -638,7 +681,6 @@ int main(int argc, char* argv[]) {
                     restore_all_thread_baselines(*cache_ptr, *cpuset_ptr, *prio_ptr, *cpuctl_ptr);
 
                     auto new_matcher = std::make_shared<ThreadMatcher>(config);
-                    auto new_scanner = std::make_shared<ProcessScanner>();
                     auto new_cpuset = std::make_shared<CpusetSetter>(*new_matcher);
                     auto new_prio = std::make_shared<PrioritySetter>(*new_matcher);
                     auto new_cpuctl = std::make_shared<CpuctlSetter>();
@@ -654,7 +696,6 @@ int main(int argc, char* argv[]) {
                     workers.push_back(std::make_unique<ScanWorker>("ScanWorker4"));
 
                     matcher_ptr = std::move(new_matcher);
-                    scanner_ptr = std::move(new_scanner);
                     cpuset_ptr = std::move(new_cpuset);
                     prio_ptr = std::move(new_prio);
                     cpuctl_ptr = std::move(new_cpuctl);
@@ -664,13 +705,18 @@ int main(int argc, char* argv[]) {
                         w->start();
                     }
                     
-                    highspeed_ms = std::max(config.sched.highspeed_sched_ms > 0 ? config.sched.highspeed_sched_ms : 100, 1);
-                    refresh_ms = std::max(config.sched.refresh_interval_ms > 0 ? config.sched.refresh_interval_ms : 1000, highspeed_ms);
-                    highspeed_loops = refresh_ms / highspeed_ms;
-                    
-                    LOG_I("Main", "Config reloaded - new intervals: highspeed=" 
-                          + std::to_string(highspeed_ms) + "ms, refresh=" 
-                          + std::to_string(refresh_ms) + "ms");
+                    highspeed_ms = std::max(config.sched.highspeed_sched_ms, 1);
+                    refresh_ms = std::max(config.sched.refresh_interval_ms, highspeed_ms);
+                    next_full_scan = std::chrono::steady_clock::now();
+                    cached_top_app_pids.clear();
+                    cached_foreground_pids.clear();
+                    top_cursor = {};
+                    pinned_cursor = {};
+                    topfore_cursor = {};
+                    foreground_cursor = {};
+
+                    LOG_I("Main", "Config reloaded - top=" + std::to_string(highspeed_ms)
+                          + "ms, full=" + std::to_string(refresh_ms) + "ms");
                     
                     last_mtime = current_mtime;
                     last_config_hash = current_hash;
@@ -685,48 +731,55 @@ int main(int argc, char* argv[]) {
             }
         }
         
-        if (cgroup_changed.load(std::memory_order_acquire)) {
-            cgroup_changed.store(false, std::memory_order_release);
-            full_rescan_needed.store(true, std::memory_order_release);
-            LOG_D("Main", "Cgroup change triggered full rescan");
-        }
-        
-        loop_counter++;
-        
+        const auto now = std::chrono::steady_clock::now();
+        const bool run_full_scan = full_rescan_needed.exchange(false, std::memory_order_acq_rel)
+            || now >= next_full_scan;
         std::set<int> processed;
-        
-        if (loop_counter >= highspeed_loops || full_rescan_needed.load()) {
-            loop_counter = 0;
-            
-            if (full_rescan_needed.load()) {
-                full_rescan_needed.store(false);
-                LOG_T("Main", "Full rescan cycle");
-            }
-            
+
+        if (run_full_scan) {
+            LOG_T("Main", "Full rescan cycle");
             std::set<int> dead_pids;
             std::set<int> pinned_pids;
             std::set<int> topfore_pids;
-            
-            scan_and_update_rule_cache(*matcher_ptr, pinned_pids, topfore_pids, dead_pids);
+            std::set<int> top_app_pids;
+            std::set<int> foreground_pids;
+
+            scan_and_update_rule_cache(*matcher_ptr, pinned_pids, topfore_pids, top_app_pids,
+                                       foreground_pids, dead_pids);
             pinned_cache->update(pinned_pids);
             topfore_cache->update(topfore_pids);
-            cleanup_dead_pids(*cache_ptr, *pinned_cache, *topfore_cache, dead_pids, pinned_pids, topfore_pids);
-            
-            dispatch_pinned_to_workers(workers, pinned_pids, processed);
-            dispatch_topfore_to_workers(workers, topfore_pids, processed);
-            dispatch_fg_top_to_workers(workers, *scanner_ptr, processed);
+            cached_top_app_pids = std::move(top_app_pids);
+            cached_foreground_pids = std::move(foreground_pids);
+            cleanup_dead_pids(*cache_ptr, *pinned_cache, *topfore_cache, dead_pids,
+                               pinned_pids, topfore_pids);
+
+            ScanBudget budget(config.sched.full_scan_budget_us, config.sched.scan_batch_size,
+                              config.sched.scan_batch_yield_us);
+            if (!dispatch_top_app_to_workers(workers, cached_top_app_pids, processed, budget, top_cursor)
+                && !budget.exhausted()
+                && !dispatch_pinned_to_workers(workers, pinned_pids, processed, budget, pinned_cursor)
+                && !budget.exhausted()
+                && !dispatch_topfore_to_workers(workers, topfore_pids, processed, budget, topfore_cursor)
+                && !budget.exhausted()) {
+                dispatch_foreground_to_workers(workers, cached_foreground_pids, processed, budget,
+                                               foreground_cursor);
+            }
+            // Schedule from completion so a full scan is never immediately followed by another full scan.
+            next_full_scan = std::chrono::steady_clock::now() + std::chrono::milliseconds(refresh_ms);
         } else {
-            dispatch_pinned_to_workers(workers, pinned_cache->get(), processed);
-            dispatch_topfore_to_workers(workers, topfore_cache->get(), processed);
-            dispatch_fg_top_to_workers(workers, *scanner_ptr, processed);
+            // High-speed path intentionally touches only top-app and rules promoted to TOP.
+            ScanBudget budget(config.sched.top_scan_budget_us, config.sched.scan_batch_size,
+                              config.sched.scan_batch_yield_us);
+            if (!dispatch_top_app_to_workers(workers, cached_top_app_pids, processed, budget, top_cursor)
+                && !budget.exhausted()
+                && !dispatch_pinned_to_workers(workers, pinned_cache->get(), processed, budget, pinned_cursor)
+                && !budget.exhausted()) {
+                dispatch_topfore_to_workers(workers, topfore_cache->get(), processed, budget, topfore_cursor);
+            }
         }
-        
-        // 动态调整睡眠时间：根据任务队列长度调整
-        int current_sleep_ms = highspeed_ms;
-        if (!processed.empty()) {
-            current_sleep_ms = std::max(highspeed_ms / 2, 10);
-        }
-        
+
+        const int current_sleep_ms = highspeed_ms;
+
         std::this_thread::sleep_for(std::chrono::milliseconds(current_sleep_ms));
         } catch (const std::exception& e) {
             LOG_E("Main", "Exception in main loop: " + std::string(e.what()));

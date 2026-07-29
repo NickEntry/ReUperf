@@ -50,8 +50,12 @@ struct PrioScene {
 
 struct SchedConfig {
     bool enable = true;
-    int refresh_interval_ms = 1000;
-    int highspeed_sched_ms = 100;
+    int refresh_interval_ms = 2000;
+    int highspeed_sched_ms = 300;
+    int top_scan_budget_us = 4000;
+    int full_scan_budget_us = 12000;
+    int scan_batch_size = 32;
+    int scan_batch_yield_us = 0;
     bool case_insensitive = false;
     LogConfig log;
     

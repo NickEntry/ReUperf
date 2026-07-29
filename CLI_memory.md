@@ -34,9 +34,9 @@ ReUperf 是基于 uperf JSON 配置格式的 Android 线程调度器。它通过
 ### 调度循环与事件
 
 1. 启动时扫描规则、初始化 cgroup，并启动 4 个 `ScanWorker`。
-2. 高频循环按 `highspeed_sched_ms` 调度缓存中的 `pinned`/`topfore` 进程，并扫描当前 FG/TOP 进程。
-3. 低频循环按 `refresh_interval_ms` 刷新规则缓存、清理死亡 PID，并执行完整调度扫描。
-4. `ProcMonitor` 通过 inotify 监控 `/proc` 的 PID 创建和删除；事件经 `EventRouter` 合并后触发增量 dispatch 和完整重扫。
+2. 高频循环按 `highspeed_sched_ms` 仅扫描缓存中的 top-app、`pinned` 和满足条件的 `topfore` PID；线程读取与投递受 `top_scan_budget_us` 限制。
+3. 低频循环按 `refresh_interval_ms` 从上一轮全量扫描完成后计时，刷新 PID 分类、清理死亡 PID，并以 `full_scan_budget_us` 分派线程。
+4. `ProcMonitor` 通过 inotify 监控 `/proc` 的 PID 创建和删除；事件经 `EventRouter` 合并后仅触发受影响 PID 的增量 dispatch，不触发完整重扫。
 5. `ConfigFileWatcher` 监控配置所在目录的文件修改；检测到有效更新后会重建 matcher、scanner 和 worker。重载与事件调度通过互斥保护，避免旧 worker 被并发访问。
 
 ## cgroup 结构与线程迁移

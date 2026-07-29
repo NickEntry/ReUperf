@@ -1,6 +1,7 @@
 #ifndef FILE_UTILS_HPP
 #define FILE_UTILS_HPP
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <fstream>
@@ -203,10 +204,8 @@ inline std::vector<int> list_tids(int pid) {
     }
     std::string task_path = "/proc/" + std::to_string(pid) + "/task";
     
-    if (!dir_exists(task_path)) {
-        return tids;
-    }
-    
+    // opendir is both the existence check and the operation. A separate stat() adds
+    // another syscall and cannot eliminate the race with a concurrently exiting process.
     DIR* dir = opendir(task_path.c_str());
     if (!dir) return tids;
     
@@ -223,6 +222,9 @@ inline std::vector<int> list_tids(int pid) {
         }
     }
     closedir(dir);
+    // readdir() order is unspecified. Keep the order stable because ScanCursor
+    // resumes a partially dispatched PID by TID value.
+    std::sort(tids.begin(), tids.end());
     return tids;
 }
 

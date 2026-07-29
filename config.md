@@ -16,8 +16,12 @@
     "sched": {
       "enable": true,
       "case_insensitive": false,
-      "refresh_interval_ms": 1000,
-      "highspeed_sched_ms": 100,
+      "refresh_interval_ms": 2000,
+      "highspeed_sched_ms": 300,
+      "top_scan_budget_us": 4000,
+      "full_scan_budget_us": 12000,
+      "scan_batch_size": 32,
+      "scan_batch_yield_us": 0,
       "log": {
         "level": "info",
         "output": "/data/adb/ReUperf/ReUperf.log"
@@ -37,8 +41,12 @@
 |------|------|--------|------|
 | `enable` | bool | true | 启用调度模块 |
 | `case_insensitive` | bool | false | 正则匹配忽略大小写，开启后 `surfaceflinger` 可匹配 `SurfaceFlinger` |
-| `refresh_interval_ms` | int | 1000 | 低频扫描间隔（毫秒），扫描 fg/top 进程并更新缓存 |
-| `highspeed_sched_ms` | int | 100 | 高频调度间隔（毫秒），调度 pinned/topfore 进程 |
+| `refresh_interval_ms` | int | 2000 | 全量校准间隔（毫秒）。从本次全量扫描完成后开始计时。模板建议设为 2000。 |
+| `highspeed_sched_ms` | int | 300 | 高频扫描间隔（毫秒），仅扫描 top-app、`pinned` 和满足条件的 `topfore` PID。模板建议设为 300。 |
+| `top_scan_budget_us` | int | 4000 | 高频扫描的线程读取/投递时间预算，范围 500-20000 微秒。 |
+| `full_scan_budget_us` | int | 12000 | 全量校准后分派线程的时间预算，范围 1000-50000 微秒。 |
+| `scan_batch_size` | int | 32 | 每读取多少个线程后检查批量让出策略，范围 1-256。 |
+| `scan_batch_yield_us` | int | 0 | 每批次主动让出 CPU 的时间，0 为关闭，范围 0-1000 微秒。 |
 | `log.level` | string | "info" | 日志级别：err/warn/info/debug/trace |
 | `log.output` | string | 见下文 | 日志输出文件路径 |
 
@@ -230,31 +238,30 @@
 
 ## 调度周期
 
-程序采用双层调度架构：
+程序采用“高频目标扫描 + 低频全量校准”模型：
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  高频循环 (highspeed_sched_ms)                               │
-│  └─ 调度缓存中的 pinned/topfore 进程                         │
-│  └─ 扫描当前 FG/TOP 进程并分派线程任务                        │
-│     响应速度快，用于实时调度关键进程                           │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-              每 (refresh_interval_ms / highspeed_sched_ms) 次后
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│  低频扫描 (refresh_interval_ms)                             │
-│  └─ 扫描 /proc 与进程 cgroup 状态                            │
-│  └─ 更新 pinned/topfore 缓存列表                             │
-│  └─ 清理死亡 PID                                            │
-│     保证进程列表与实际状态同步                               │
-└─────────────────────────────────────────────────────────────┘
+```text
+每 highspeed_sched_ms：
+  仅扫描上一次校准得到的 top-app PID、pinned PID、以及处于 FG 的 topfore PID。
+  线程读取与任务投递最多占用 top_scan_budget_us；预算耗尽后记录 PID/TID 游标，下一轮续扫。
+
+每 refresh_interval_ms（从上一轮全量扫描结束后计时）：
+  遍历 /proc，刷新 top-app / FG / pinned / topfore PID 集合，清理死亡 PID；
+  再以 full_scan_budget_us 分派 TOP、规则提升 TOP 和 FG 线程。
+
+进程创建/退出事件：
+  仅处理受影响的单一 PID，不触发全局 /proc 扫描。
 ```
 
-| 参数 | 默认值 | 调整建议 |
-|------|--------|---------|
-| `highspeed_sched_ms` | 100ms | 降低可提高响应速度，但增加 CPU 占用 |
-| `refresh_interval_ms` | 1000ms | 提高可降低系统负载，但进程发现延迟增加 |
+线程目录不会先 `stat()`：`opendir("/proc/<pid>/task")` 直接充当存在性检查，读取 `comm` 失败的已退出线程会跳过。额外的预检查会增加一次 syscall，且不能消除线程同时退出导致的 TOCTOU 竞态。
+
+| 参数 | 推荐起点 | 调整建议 |
+|------|---------|---------|
+| `highspeed_sched_ms` | 300ms | 降低可提高新线程响应速度，但增加目标 PID 扫描频率。 |
+| `refresh_interval_ms` | 2000ms | 提高可降低全系统 `/proc` 校准频率，但 PID/cgroup 集合更新更慢。 |
+| `top_scan_budget_us` | 4000us | 主线程尖峰偏高时下调；目标游戏线程很多且发现延迟明显时上调。 |
+| `full_scan_budget_us` | 12000us | 全量校准后的线程投递预算；不限制 PID 枚举本身。 |
+| `scan_batch_yield_us` | 0us | 仅在预算仍无法平滑峰值时尝试 50-100us；不建议 1000us。 |
 
 ## 兼容性
 

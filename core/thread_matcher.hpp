@@ -54,7 +54,10 @@ struct CompiledProcessRule {
     std::vector<CompiledThreadRule> thread_rules;
 };
 
-static constexpr size_t kMaxRegexLength = 200;
+// Regex patterns are user-maintained, trusted configuration. Deliberately do not
+// add ReDoS syntax restrictions or other defensive filtering; users retain full
+// regex control. This limit only rejects anomalously large configuration entries.
+static constexpr size_t kMaxRegexLength = 500;
 
 class ThreadMatcher {
 public:
@@ -73,7 +76,7 @@ public:
             // Wrap with .* for contains-match semantics
             expanded = ".*" + expanded + ".*";
             
-            // Security: limit regex length to prevent ReDoS
+            // Keep only the configured maximum entry size; ReDoS filtering is intentionally omitted.
             if (expanded.length() > kMaxRegexLength) {
                 LOG_W("ThreadMatcher", "Skip regex exceeding " + std::to_string(kMaxRegexLength) 
                       + " chars: " + rule.regex_str);
@@ -94,7 +97,8 @@ public:
                 
                 // Wrap with .* for contains-match semantics
                 comm_expanded = ".*" + comm_expanded + ".*";
-                
+
+                // Keep only the configured maximum entry size; ReDoS filtering is intentionally omitted.
                 if (comm_expanded.length() > kMaxRegexLength) {
                     LOG_W("ThreadMatcher", "Skip comm_regex exceeding " + std::to_string(kMaxRegexLength) 
                           + " chars: " + rule.comm_regex_str);
@@ -124,7 +128,7 @@ public:
                     // Wrap with .* for contains-match semantics
                     tk = ".*" + tk + ".*";
                     
-                    // Security: limit regex length to prevent ReDoS
+                    // Keep only the configured maximum entry size; ReDoS filtering is intentionally omitted.
                     if (tk.length() > kMaxRegexLength) {
                         LOG_W("ThreadMatcher", "Skip thread regex exceeding " 
                               + std::to_string(kMaxRegexLength) + " chars: " + tr.keyword);
