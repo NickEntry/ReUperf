@@ -1,22 +1,25 @@
 #include <iostream>
 #include <chrono>
 #include <thread>
+#include <algorithm>
 #include <atomic>
 #include <csignal>
 #include <set>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
-#if defined(__linux__) && !defined(USE_CAPABILITY_STUB)
+#if defined(__linux__)
+    #include <fcntl.h>
     #include <unistd.h>
     #include <sys/stat.h>
     #include <sys/types.h>
     #include <sys/inotify.h>
     #include <poll.h>
+#endif
+#if defined(__linux__) && !defined(USE_CAPABILITY_STUB)
     #include <sys/capability.h>
 #else
     // Non-Linux platforms or cross-compile without libcap: provide stub for capability functions
-#include <cstdint>
     #define CAP_SET 1
     #define CAP_CLEAR 0
     #define CAP_EFFECTIVE 1
@@ -50,6 +53,7 @@
 #include "scheduler/cpuctl_setter.hpp"
 
 namespace {
+    volatile std::sig_atomic_t signal_requested = 0;
     std::atomic<bool> running(true);
     std::atomic<bool> cgroup_changed(false);
     std::atomic<bool> full_rescan_needed(true);
@@ -59,8 +63,7 @@ namespace {
 
 void signal_handler(int sig) {
     (void)sig;
-    running.store(false, std::memory_order_seq_cst);
-    shutdown_requested.store(true, std::memory_order_seq_cst);
+    signal_requested = 1;
 }
 
 void ensure_data_dir() {
@@ -98,10 +101,8 @@ uint64_t compute_config_hash(const std::string& path) {
 
 class ConfigFileWatcher {
 public:
-    // Design: config change detection has a one-cycle delay by design.
-    // The inotify event sets an internal flag; the flag is consumed on the
-    // next call to check_and_clear(). This avoids partial-write race conditions
-    // where the config file is being written while we try to read it.
+    // The watcher reports observed writes; the main loop combines this signal
+    // with mtime/hash detection and updates its baseline after a successful reload.
     explicit ConfigFileWatcher(const std::string& config_path)
         : config_path_(config_path), inotify_fd_(-1), watch_fd_(-1), config_changed_(false) {}
 
@@ -114,6 +115,14 @@ public:
         inotify_fd_ = inotify_init();
         if (inotify_fd_ < 0) {
             LOG_W("ConfigFileWatcher", "inotify_init failed: " + std::string(strerror(errno)));
+            return false;
+        }
+        const int flags = fcntl(inotify_fd_, F_GETFL);
+        if (flags < 0 || fcntl(inotify_fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
+            LOG_W("ConfigFileWatcher", "Failed to make inotify non-blocking: "
+                  + std::string(strerror(errno)));
+            close(inotify_fd_);
+            inotify_fd_ = -1;
             return false;
         }
 
@@ -156,17 +165,22 @@ public:
         char buf[1024];
         ssize_t len = read(inotify_fd_, buf, sizeof(buf));
         if (len > 0) {
-            for (ssize_t i = 0; i < len; ) {
+            for (ssize_t i = 0; i + static_cast<ssize_t>(sizeof(struct inotify_event)) <= len; ) {
                 struct inotify_event* event = reinterpret_cast<struct inotify_event*>(&buf[i]);
+                const ssize_t record_size = static_cast<ssize_t>(sizeof(struct inotify_event)) + event->len;
+                if (record_size > len - i) {
+                    LOG_W("ConfigFileWatcher", "Truncated inotify event record");
+                    break;
+                }
                 if (event->len > 0 && watch_basename_.compare(
                         0, std::string::npos, event->name,
                         strnlen(event->name, event->len)) == 0) {
                     if (event->mask & IN_MODIFY) {
                         LOG_D("ConfigFileWatcher", "Config file modified");
-                        return config_changed_.exchange(true, std::memory_order_acq_rel);
+                        config_changed_.store(true, std::memory_order_release);
                     }
                 }
-                i += sizeof(struct inotify_event) + event->len;
+                i += record_size;
             }
         }
         return config_changed_.exchange(false, std::memory_order_acq_rel);
@@ -365,6 +379,26 @@ void cleanup_dead_pids(ThreadCache& cache, PinnedCache& pinned_cache,
     }
 }
 
+void restore_all_thread_baselines(ThreadCache& cache, CpusetSetter& cpuset,
+                                  PrioritySetter& prio, CpuctlSetter& cpuctl) {
+    for (auto& [key, baseline] : cache.take_all_baselines()) {
+        const int tid = key.second;
+        if (baseline.has_affinity && !cpuset.restore_affinity(tid, baseline.affinity)) {
+            LOG_W("Main", "Failed to restore affinity for tid " + std::to_string(tid));
+        }
+        if (baseline.has_scheduler && !prio.restore_scheduler(
+                tid, baseline.scheduler_policy, baseline.scheduler_priority, baseline.nice)) {
+            LOG_W("Main", "Failed to restore scheduler for tid " + std::to_string(tid));
+        }
+        if (baseline.has_cpuset_path && !cpuset.restore_cpuset_cgroup(tid, baseline.cpuset_path)) {
+            LOG_W("Main", "Failed to restore cpuset cgroup for tid " + std::to_string(tid));
+        }
+        if (baseline.has_cpuctl_path && !cpuctl.restore_cpuctl_cgroup(tid, baseline.cpuctl_path)) {
+            LOG_W("Main", "Failed to restore cpuctl cgroup for tid " + std::to_string(tid));
+        }
+    }
+}
+
 int main(int argc, char* argv[]) {
     // Whitelist config path - only allow files under /data/adb/ReUperf/
     std::string config_path = "/data/adb/ReUperf/ReUperf.json";
@@ -560,21 +594,20 @@ int main(int argc, char* argv[]) {
     
     int loop_counter = 0;
     
-    while (running) {
-        try {
-        bool config_changed_inotify = config_watcher.check_and_clear();
-        bool config_changed_fallback = false;
-
-        if (!config_changed_inotify) {
-            time_t current_mtime = get_file_mtime(config_path);
-            uint64_t current_hash = compute_config_hash(config_path);
-            config_changed_fallback = (current_mtime != last_mtime && current_mtime > 0) ||
-                                     (current_hash != last_config_hash && current_hash != 0);
-            if (config_changed_fallback) {
-                last_mtime = current_mtime;
-                last_config_hash = current_hash;
-            }
+    while (running.load(std::memory_order_acquire)) {
+        if (signal_requested != 0) {
+            shutdown_requested.store(true, std::memory_order_release);
+            running.store(false, std::memory_order_release);
+            continue;
         }
+
+        try {
+        const bool config_changed_inotify = config_watcher.check_and_clear();
+        const time_t current_mtime = get_file_mtime(config_path);
+        const uint64_t current_hash = compute_config_hash(config_path);
+        const bool config_changed_fallback =
+            (current_mtime != last_mtime && current_mtime > 0)
+            || (current_hash != last_config_hash && current_hash != 0);
 
         if (config_changed_inotify || config_changed_fallback) {
             LOG_I("Main", "Config file changed, reloading...");
@@ -602,6 +635,7 @@ int main(int argc, char* argv[]) {
                     for (auto& w : workers) {
                         w->stop();
                     }
+                    restore_all_thread_baselines(*cache_ptr, *cpuset_ptr, *prio_ptr, *cpuctl_ptr);
 
                     auto new_matcher = std::make_shared<ThreadMatcher>(config);
                     auto new_scanner = std::make_shared<ProcessScanner>();
@@ -638,6 +672,8 @@ int main(int argc, char* argv[]) {
                           + std::to_string(highspeed_ms) + "ms, refresh=" 
                           + std::to_string(refresh_ms) + "ms");
                     
+                    last_mtime = current_mtime;
+                    last_config_hash = current_hash;
                     full_rescan_needed.store(true);
                 } else {
                     LOG_I("Main", "New config has sched disabled, exiting");
@@ -705,6 +741,8 @@ int main(int argc, char* argv[]) {
     for (auto& w : workers) {
         w->stop();
     }
+    restore_all_thread_baselines(*cache_ptr, *cpuset_ptr, *prio_ptr, *cpuctl_ptr);
+    cache_ptr->clear();
     
     if (shutdown_requested.load(std::memory_order_seq_cst)) {
         LOG_I("Main", "ReUperf Thread Scheduler stopped (signal)");

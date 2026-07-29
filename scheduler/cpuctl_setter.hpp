@@ -16,6 +16,18 @@ public:
         return "/dev/cpuctl";
     }
     
+    bool restore_cpuctl_cgroup(int tid, const std::string& cgroup_path) {
+        if (tid <= 0 || cgroup_path.empty()) {
+            return false;
+        }
+        if (!FileUtils::write_cgroup_tasks(cgroup_path, tid)) {
+            LOG_W("CpuctlSetter", "Failed to restore tid " + std::to_string(tid)
+                  + " to cpuctl " + cgroup_path);
+            return false;
+        }
+        return true;
+    }
+
     bool apply_with_result(int /*pid*/, int tid, const MatchResult& result) {
         if (!result.matched || !result.enable_limit) {
             return true;

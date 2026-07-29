@@ -23,6 +23,29 @@ public:
     PrioritySetter(ThreadMatcher& matcher)
         : matcher_(matcher) {}
 
+    bool capture_scheduler_baseline(int tid, int& policy, int& priority, int& nice) {
+        policy = sched_getscheduler(tid);
+        priority = 0;
+        nice = 0;
+        if (policy < 0) {
+            return false;
+        }
+
+        sched_param param{};
+        if (sched_getparam(tid, &param) != 0) {
+            return false;
+        }
+        priority = param.sched_priority;
+        if (policy == normal_policy() || policy == batch_policy() || policy == idle_policy()) {
+            errno = 0;
+            nice = getpriority(PRIO_PROCESS, tid);
+            if (errno != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     CurrentSched get_current_sched(int tid) {
         CurrentSched curr;
         curr.policy = sched_getscheduler(tid);
@@ -125,8 +148,10 @@ public:
                       + std::to_string(tid));
                 return false;
             }
-            set_nice_value(tid, prio_value - 120);
-            LOG_T("PrioritySetter", "Set tid " + std::to_string(tid) 
+            if (!set_nice_value(tid, prio_value - 120)) {
+                return false;
+            }
+            LOG_T("PrioritySetter", "Set tid " + std::to_string(tid)
                   + " to SCHED_NORMAL nice=" + std::to_string(prio_value - 120));
         } else if (prio_value == -1) {
             param.sched_priority = 0;
@@ -161,6 +186,27 @@ public:
         return true;
     }
     
+    bool restore_scheduler(int tid, int policy, int priority, int nice) {
+        if (tid <= 0 || policy < 0) {
+            return false;
+        }
+
+        sched_param param{};
+        param.sched_priority = priority;
+        if (sched_setscheduler(tid, policy, &param) != 0) {
+            LOG_W("PrioritySetter", "Failed to restore scheduler for tid " + std::to_string(tid)
+                  + ": " + std::string(strerror(errno)));
+            return false;
+        }
+
+        if (policy == normal_policy() || policy == batch_policy() || policy == idle_policy()) {
+            if (!set_nice_value(tid, nice)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool apply_with_result(int pid, int tid, const MatchResult& result) {
         (void)pid;
         if (!result.matched) {

@@ -72,7 +72,15 @@ inline bool write_file(const std::string& path, const std::string& content) {
     while (written < total) {
         ssize_t ret = write(fd, buf + written, total - written);
         if (ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
             LOG_E("FileUtils", "write failed: " + path + " (" + std::string(strerror(errno)) + ")");
+            close(fd);
+            return false;
+        }
+        if (ret == 0) {
+            LOG_E("FileUtils", "write returned zero bytes: " + path);
             close(fd);
             return false;
         }
@@ -94,6 +102,24 @@ namespace {
     inline std::list<std::string> file_cache_lru;
     static constexpr int kFileCacheTTLMs = 100;
     static constexpr size_t kMaxCacheSize = 1000;
+
+    inline void touch_file_cache_entry(const std::string& path) {
+        auto order_it = file_cache_order.find(path);
+        if (order_it != file_cache_order.end()) {
+            file_cache_lru.erase(order_it->second);
+        }
+        file_cache_lru.push_back(path);
+        file_cache_order[path] = --file_cache_lru.end();
+    }
+
+    inline void erase_file_cache_entry(const std::string& path) {
+        file_cache.erase(path);
+        auto order_it = file_cache_order.find(path);
+        if (order_it != file_cache_order.end()) {
+            file_cache_lru.erase(order_it->second);
+            file_cache_order.erase(order_it);
+        }
+    }
 }
 
 inline std::string read_file(const std::string& path) {
@@ -103,12 +129,7 @@ inline std::string read_file(const std::string& path) {
         auto it = file_cache.find(path);
         if (it != file_cache.end() && std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - it->second.timestamp).count() < kFileCacheTTLMs) {
-            auto lru_it = file_cache_order.find(path);
-            if (lru_it != file_cache_order.end()) {
-                file_cache_lru.erase(lru_it->second);
-                file_cache_lru.push_back(path);
-                file_cache_order[path] = --file_cache_lru.end();
-            }
+            touch_file_cache_entry(path);
             return it->second.content;
         }
     }
@@ -126,29 +147,23 @@ inline std::string read_file(const std::string& path) {
     
     {
         std::lock_guard<std::mutex> lock(file_cache_mutex);
-        if (file_cache.size() >= kMaxCacheSize && !file_cache_lru.empty()) {
-            auto oldest = file_cache_lru.front();
-            file_cache_lru.pop_front();
-            file_cache.erase(oldest);
-            file_cache_order.erase(oldest);
+        const bool replacing = file_cache.find(path) != file_cache.end();
+        if (!replacing && file_cache.size() >= kMaxCacheSize && !file_cache_lru.empty()) {
+            const std::string oldest = file_cache_lru.front();
+            erase_file_cache_entry(oldest);
         }
         file_cache[path] = {content, now};
-        file_cache_lru.push_back(path);
-        file_cache_order[path] = --file_cache_lru.end();
+        touch_file_cache_entry(path);
     }
     return content;
 }
 
-// Android-specific PID range: 1 ~ 32768 (actual limit is task_max, typically 32768)
-static constexpr int kMaxPid = 32768;
-static constexpr int kMaxTid = 117616;
-
-inline bool is_valid_pid(int pid) {
-    return pid > 0 && pid <= kMaxPid;
+inline bool is_valid_pid(long pid) {
+    return pid > 0 && pid <= INT_MAX;
 }
 
-inline bool is_valid_tid(int tid) {
-    return tid > 0 && tid <= kMaxTid;
+inline bool is_valid_tid(long tid) {
+    return tid > 0 && tid <= INT_MAX;
 }
 
 inline bool is_all_digits(const char* s) {
@@ -170,7 +185,7 @@ inline std::vector<int> list_pids() {
             errno = 0;
             char* end = nullptr;
             long pid = strtol(entry->d_name, &end, 10);
-            // Security: validate PID range (Android-specific: 1~32768)
+            // Validate the parsed value before narrowing it to int.
             if (errno == 0 && end != entry->d_name && *end == '\0' && is_valid_pid(pid)) {
                 pids.push_back(static_cast<int>(pid));
             }
@@ -182,7 +197,7 @@ inline std::vector<int> list_pids() {
 
 inline std::vector<int> list_tids(int pid) {
     std::vector<int> tids;
-    // Security: validate PID range (Android-specific)
+    // Validate the parsed value before constructing a /proc path.
     if (!is_valid_pid(pid)) {
         return tids;
     }
@@ -201,7 +216,7 @@ inline std::vector<int> list_tids(int pid) {
             errno = 0;
             char* end = nullptr;
             long tid = strtol(entry->d_name, &end, 10);
-            // Security: validate TID range (Android-specific: 1~117616)
+            // Validate the parsed value before narrowing it to int.
             if (errno == 0 && end != entry->d_name && *end == '\0' && is_valid_tid(tid)) {
                 tids.push_back(static_cast<int>(tid));
             }
@@ -314,56 +329,116 @@ inline std::string get_thread_name(int pid, int tid) {
     return get_thread_comm(pid, tid);
 }
 
-inline std::string get_cgroup_path(int pid, const std::string& controller) {
-    struct CgroupCacheKey {
-        int pid;
-        std::string controller;
-        
-        bool operator==(const CgroupCacheKey& other) const {
-            return pid == other.pid && controller == other.controller;
-        }
-    };
-    
-    struct CgroupCacheKeyHash {
-        size_t operator()(const CgroupCacheKey& k) const {
-            return std::hash<int>{}(k.pid) ^ (std::hash<std::string>{}(k.controller) << 1);
-        }
-    };
-    
-    static std::unordered_map<CgroupCacheKey, std::pair<std::string, int64_t>, CgroupCacheKeyHash> cache;
-    static std::mutex cache_mutex;
+struct CgroupCacheKey {
+    uint64_t pid;
+    std::string controller;
+
+    bool operator==(const CgroupCacheKey& other) const {
+        return pid == other.pid && controller == other.controller;
+    }
+};
+
+struct CgroupCacheKeyHash {
+    size_t operator()(const CgroupCacheKey& key) const {
+        return std::hash<uint64_t>{}(key.pid) ^ (std::hash<std::string>{}(key.controller) << 1);
+    }
+};
+
+struct CgroupCacheEntry {
+    std::string path;
+    std::chrono::steady_clock::time_point timestamp;
+};
+
+inline std::unordered_map<CgroupCacheKey, CgroupCacheEntry, CgroupCacheKeyHash>& get_cgroup_cache() {
+    static std::unordered_map<CgroupCacheKey, CgroupCacheEntry, CgroupCacheKeyHash> cache;
+    return cache;
+}
+
+inline std::mutex& get_cgroup_cache_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+inline std::string get_cgroup_path_from_file(const std::string& cgroup_file,
+                                              uint64_t cache_pid,
+                                              const std::string& controller) {
     static constexpr int64_t kCacheTTLMs = 100;
-    
-    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    
-    CgroupCacheKey key{pid, controller};
-    
+    static constexpr size_t kMaxCgroupCacheSize = 1000;
+
+    const auto now = std::chrono::steady_clock::now();
+    const CgroupCacheKey key{cache_pid, controller};
     {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        auto it = cache.find(key);
-        if (it != cache.end() && (now - it->second.second) < kCacheTTLMs) {
-            return it->second.first;
+        std::lock_guard<std::mutex> lock(get_cgroup_cache_mutex());
+        auto& cache = get_cgroup_cache();
+        const auto it = cache.find(key);
+        if (it != cache.end()
+            && std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.timestamp).count()
+                < kCacheTTLMs) {
+            return it->second.path;
         }
     }
-    
-    std::string cgroups = read_file("/proc/" + std::to_string(pid) + "/cgroup");
+
+    std::string result;
+    const std::string cgroups = read_file(cgroup_file);
     std::istringstream iss(cgroups);
     std::string line;
     while (std::getline(iss, line)) {
-        if (line.find(controller) != std::string::npos) {
-            size_t pos = line.find(':');
-            if (pos != std::string::npos) {
-                std::string result = line.substr(pos + 1);
-                std::lock_guard<std::mutex> lock(cache_mutex);
-                cache[key] = {result, now};
-                return result;
+        const size_t first_colon = line.find(':');
+        const size_t second_colon = first_colon == std::string::npos
+            ? std::string::npos : line.find(':', first_colon + 1);
+        if (second_colon == std::string::npos) {
+            continue;
+        }
+
+        const std::string controllers = line.substr(first_colon + 1, second_colon - first_colon - 1);
+        std::istringstream controller_list(controllers);
+        std::string listed_controller;
+        while (std::getline(controller_list, listed_controller, ',')) {
+            if (listed_controller == controller) {
+                // Android targets expose cgroup paths with v1-compatible semantics here.
+                // Do not over-generalize this parser for non-Android cgroup layouts.
+                result = line.substr(second_colon + 1);
+                break;
             }
         }
+        if (!result.empty()) {
+            break;
+        }
     }
-    std::lock_guard<std::mutex> lock(cache_mutex);
-    cache[key] = {"", now};
-    return "";
+
+    {
+        std::lock_guard<std::mutex> lock(get_cgroup_cache_mutex());
+        auto& cache = get_cgroup_cache();
+        if (cache.size() >= kMaxCgroupCacheSize) {
+            for (auto it = cache.begin(); it != cache.end();) {
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - it->second.timestamp).count();
+                if (elapsed >= kCacheTTLMs) {
+                    it = cache.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (cache.size() >= kMaxCgroupCacheSize) {
+                cache.erase(cache.begin());
+            }
+        }
+        cache[key] = {result, now};
+    }
+    return result;
+}
+
+inline std::string get_cgroup_path(int pid, const std::string& controller) {
+    return get_cgroup_path_from_file(
+        "/proc/" + std::to_string(pid) + "/cgroup", pid, controller);
+}
+
+inline std::string get_thread_cgroup_path(int pid, int tid, const std::string& controller) {
+    const uint64_t cache_key = (static_cast<uint64_t>(static_cast<uint32_t>(pid)) << 32)
+        | static_cast<uint32_t>(tid);
+    return get_cgroup_path_from_file(
+        "/proc/" + std::to_string(pid) + "/task/" + std::to_string(tid) + "/cgroup",
+        cache_key, controller);
 }
 
 // Security: Get process UID for ownership verification

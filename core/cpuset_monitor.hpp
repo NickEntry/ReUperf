@@ -117,28 +117,31 @@ private:
             }
             
             ssize_t i = 0;
-            while (i < len) {
+            while (i + static_cast<ssize_t>(EVENT_SIZE) <= len) {
                 struct inotify_event* event = reinterpret_cast<struct inotify_event*>(&buf[i]);
-                
+                const ssize_t record_size = static_cast<ssize_t>(EVENT_SIZE) + event->len;
+                if (record_size > len - i) {
+                    LOG_W("ProcMonitor", "Truncated inotify event record");
+                    break;
+                }
+
                 if (event->len > 0) {
                     // event->len includes the null terminator (per inotify(7)).
                     // Use strnlen to get the actual name length without trailing nulls.
                     std::string name(event->name, strnlen(event->name, event->len));
-                    
-                    if (event->mask & IN_CREATE) {
-                        if (name.find_first_not_of("0123456789") == std::string::npos) {
-                            int pid = std::stoi(name);
-                            if (pid > 0) {
+                    if (FileUtils::is_all_digits(name.c_str())) {
+                        errno = 0;
+                        char* end = nullptr;
+                        const long parsed_pid = strtol(name.c_str(), &end, 10);
+                        if (errno == 0 && end != name.c_str() && *end == '\0'
+                            && FileUtils::is_valid_pid(parsed_pid)) {
+                            const int pid = static_cast<int>(parsed_pid);
+                            if (event->mask & IN_CREATE) {
                                 LOG_D("ProcMonitor", "Process created: " + name);
                                 if (on_process_change_) {
                                     on_process_change_(pid);
                                 }
-                            }
-                        }
-                    } else if (event->mask & IN_DELETE) {
-                        if (name.find_first_not_of("0123456789") == std::string::npos) {
-                            int pid = std::stoi(name);
-                            if (pid > 0) {
+                            } else if (event->mask & IN_DELETE) {
                                 LOG_D("ProcMonitor", "Process deleted: " + name);
                                 if (on_process_change_) {
                                     on_process_change_(-pid);
@@ -147,8 +150,8 @@ private:
                         }
                     }
                 }
-                
-                i += EVENT_SIZE + event->len;
+
+                i += record_size;
             }
         }
     }

@@ -1,12 +1,13 @@
 #ifndef CGROUP_INIT_HPP
 #define CGROUP_INIT_HPP
 
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
 #include <string>
 #include <vector>
 #include <map>
-#ifdef __ANDROID__
 #include <unistd.h>
-#endif
 #include "../config/config_types.hpp"
 #include "../utils/file_utils.hpp"
 #include "../utils/logger.hpp"
@@ -93,7 +94,11 @@ private:
             LOG_D("CgroupInit", "Set " + child_path + "/cpus = " + cpus_str);
             
             if (!root_mems.empty() && ensure_cgroup_file_exists(child_path + "/mems")) {
-                FileUtils::write_file(child_path + "/mems", root_mems);
+                if (!FileUtils::write_file(child_path + "/mems", root_mems)) {
+                    LOG_W("CgroupInit", "Failed to set mems for " + child_path);
+                    failed++;
+                    continue;
+                }
                 LOG_D("CgroupInit", "Set " + child_path + "/mems = " + root_mems);
             }
             
@@ -125,9 +130,9 @@ private:
             }
         }
         
-        LOG_I("CgroupInit", "cpuset cgroups: " + std::to_string(created) 
+        LOG_I("CgroupInit", "cpuset cgroups: " + std::to_string(created)
               + " groups created, " + std::to_string(failed) + " failed");
-        return true;
+        return failed == 0;
     }
 
     static bool init_cpuctl(const Config& config) {
@@ -147,12 +152,15 @@ private:
             return false;
         }
         
+        int failed = 0;
+
         // 创建各规则子组，以及每个线程规则的 A{index} 子组
         for (const auto& rule : config.sched.rules) {
             std::string rule_path = reuperf_path + "/" + rule.name;
             
             if (!FileUtils::mkdir_recursive(rule_path)) {
                 LOG_W("CgroupInit", "Failed to create cpuctl: " + rule_path);
+                failed++;
                 continue;
             }
             
@@ -166,25 +174,24 @@ private:
                 std::string sub_path = rule_path + "/A" + std::to_string(i + 1);
                 if (!FileUtils::mkdir_recursive(sub_path)) {
                     LOG_W("CgroupInit", "Failed to create cpuctl: " + sub_path);
+                    failed++;
                     continue;
                 }
 
                 if (tr.uclamp_max.has_value()) {
                     std::string uclamp_path = sub_path + "/cpu.uclamp.max";
-                    if (FileUtils::file_exists(uclamp_path)) {
-                        FileUtils::write_file(uclamp_path,
-                            std::to_string(tr.uclamp_max.value()));
-                    } else {
-                        LOG_W("CgroupInit", uclamp_path + " not found, skipping");
+                    if (!FileUtils::file_exists(uclamp_path)
+                        || !FileUtils::write_file(uclamp_path, std::to_string(tr.uclamp_max.value()))) {
+                        LOG_W("CgroupInit", "Failed to configure " + uclamp_path);
+                        failed++;
                     }
                 }
                 if (tr.cpu_share.has_value()) {
                     std::string shares_path = sub_path + "/cpu.shares";
-                    if (FileUtils::file_exists(shares_path)) {
-                        FileUtils::write_file(shares_path,
-                            std::to_string(tr.cpu_share.value()));
-                    } else {
-                        LOG_W("CgroupInit", shares_path + " not found, skipping");
+                    if (!FileUtils::file_exists(shares_path)
+                        || !FileUtils::write_file(shares_path, std::to_string(tr.cpu_share.value()))) {
+                        LOG_W("CgroupInit", "Failed to configure " + shares_path);
+                        failed++;
                     }
                 }
 
@@ -192,8 +199,8 @@ private:
             }
         }
         
-        LOG_I("CgroupInit", "cpuctl cgroups initialized");
-        return true;
+        LOG_I("CgroupInit", "cpuctl cgroups initialized, " + std::to_string(failed) + " failures");
+        return failed == 0;
     }
 };
 

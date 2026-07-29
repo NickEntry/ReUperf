@@ -56,29 +56,29 @@ public:
         }
         
         std::string path = "/dev/cpuset/ReUperf_" + cpumask_name;
-        
-        std::lock_guard<std::mutex> lock(mutex_);
-        
-        if (skip_groups_.count(path) > 0) {
-            return false;
-        }
-        
-        if (!checked_groups_.count(path)) {
-            checked_groups_.insert(path);
-            
-            // 缓存 cpus 文件内容，避免重复读取
-            if (cpus_cache_.find(path) == cpus_cache_.end()) {
-                std::string cpus_val = FileUtils::read_file(path + "/cpus");
-                cpus_cache_[path] = cpus_val;
-            }
-            
-            if (cpus_cache_[path].empty()) {
-                LOG_W("CpusetSetter", path + "/cpus is empty, skipping all moves to this group");
-                skip_groups_.insert(path);
+        bool group_ready = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (skip_groups_.count(path) > 0) {
                 return false;
             }
+
+            if (!checked_groups_.count(path)) {
+                checked_groups_.insert(path);
+                cpus_cache_[path] = FileUtils::read_file(path + "/cpus");
+                if (cpus_cache_[path].empty()) {
+                    LOG_W("CpusetSetter", path + "/cpus is empty, skipping all moves to this group");
+                    skip_groups_.insert(path);
+                    return false;
+                }
+            }
+            group_ready = true;
         }
-        
+        if (!group_ready) {
+            return false;
+        }
+
+        // Keep this lightweight; do not over-defend against trusted local configuration.
         // 增加重试机制
         constexpr int kMaxRetries = 3;
         constexpr int kRetryIntervalMs = 10;
@@ -98,6 +98,29 @@ public:
         return false;
     }
     
+    bool restore_affinity(int tid, const std::vector<int>& cpus) {
+        if (tid <= 0 || cpus.empty()) {
+            return false;
+        }
+        if (!CpuMask::set_affinity(tid, cpus)) {
+            LOG_W("CpusetSetter", "Failed to restore affinity for tid " + std::to_string(tid));
+            return false;
+        }
+        return true;
+    }
+
+    bool restore_cpuset_cgroup(int tid, const std::string& cgroup_path) {
+        if (tid <= 0 || cgroup_path.empty()) {
+            return false;
+        }
+        if (!FileUtils::write_cgroup_tasks(cgroup_path, tid)) {
+            LOG_W("CpusetSetter", "Failed to restore tid " + std::to_string(tid)
+                  + " to cpuset " + cgroup_path);
+            return false;
+        }
+        return true;
+    }
+
     bool apply_with_result(int /*pid*/, int tid, const MatchResult& result,
                            [[maybe_unused]] const std::string& cgroup_base) {
         LOG_D("CpusetSetter", "apply_with_result called: tid=" + std::to_string(tid) 

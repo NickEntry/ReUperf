@@ -42,6 +42,7 @@ inline bool is_result_equal(const MatchResult& a, const MatchResult& b) {
 struct CompiledThreadRule {
     ThreadRule rule;
     std::regex pattern;
+    size_t source_rule_index = 0;
     bool is_main_thread_rule = false;
 };
 
@@ -65,7 +66,8 @@ public:
             CompiledProcessRule cr;
             cr.rule = rule;
 
-            std::string expanded = expand_process_regex(rule.regex_str,
+            RegexPattern process_regex = parse_regex_pattern(rule.regex_str);
+            std::string expanded = expand_process_regex(process_regex.pattern,
                 launcher_package_, "");
             
             // Wrap with .* for contains-match semantics
@@ -79,13 +81,15 @@ public:
             }
             
             try {
-                cr.pattern = std::regex(expanded, regex_flags);
+                cr.pattern = std::regex(expanded, regex_flags_for(process_regex, regex_flags));
             } catch (const std::regex_error&) {
                 LOG_W("ThreadMatcher", "Skip invalid process regex: " + rule.regex_str);
+                continue;
             }
 
             if (!rule.comm_regex_str.empty() && rule.comm_regex_str != "^$") {
-                std::string comm_expanded = expand_process_regex(rule.comm_regex_str,
+                RegexPattern comm_regex = parse_regex_pattern(rule.comm_regex_str);
+                std::string comm_expanded = expand_process_regex(comm_regex.pattern,
                     launcher_package_, "");
                 
                 // Wrap with .* for contains-match semantics
@@ -96,7 +100,7 @@ public:
                           + " chars: " + rule.comm_regex_str);
                 } else {
                     try {
-                        cr.comm_pattern = std::regex(comm_expanded, regex_flags);
+                        cr.comm_pattern = std::regex(comm_expanded, regex_flags_for(comm_regex, regex_flags));
                         cr.has_comm_pattern = true;
                     } catch (const std::regex_error&) {
                         LOG_W("ThreadMatcher", "Skip invalid comm process regex: " + rule.comm_regex_str);
@@ -104,15 +108,18 @@ public:
                 }
             }
 
-            for (const auto& tr : rule.thread_rules) {
+            for (size_t source_rule_index = 0; source_rule_index < rule.thread_rules.size(); ++source_rule_index) {
+                const auto& tr = rule.thread_rules[source_rule_index];
                 CompiledThreadRule ctr;
                 ctr.rule = tr;
+                ctr.source_rule_index = source_rule_index;
+                RegexPattern thread_regex = parse_regex_pattern(tr.keyword);
 
-                if (tr.keyword == "/MAIN_THREAD/") {
+                if (thread_regex.pattern == "/MAIN_THREAD/") {
                     ctr.pattern = std::regex("^$");
                     ctr.is_main_thread_rule = true;
                 } else {
-                    std::string tk = expand_thread_regex(tr.keyword, "");
+                    std::string tk = expand_thread_regex(thread_regex.pattern, "");
                     
                     // Wrap with .* for contains-match semantics
                     tk = ".*" + tk + ".*";
@@ -125,7 +132,7 @@ public:
                     }
                     
                     try {
-                        ctr.pattern = std::regex(tk, regex_flags);
+                        ctr.pattern = std::regex(tk, regex_flags_for(thread_regex, regex_flags));
                     } catch (const std::regex_error&) {
                         LOG_W("ThreadMatcher", "Skip invalid thread regex: " + tr.keyword);
                         continue;
@@ -226,6 +233,26 @@ public:
     }
 
 private:
+    struct RegexPattern {
+        std::string pattern;
+        bool case_insensitive = false;
+    };
+
+    static RegexPattern parse_regex_pattern(const std::string& pattern) {
+        constexpr const char* kCaseInsensitivePrefix = "(?i)";
+        constexpr size_t kCaseInsensitivePrefixLength = 4;
+
+        if (pattern.compare(0, kCaseInsensitivePrefixLength, kCaseInsensitivePrefix) == 0) {
+            return {pattern.substr(kCaseInsensitivePrefixLength), true};
+        }
+        return {pattern, false};
+    }
+
+    static std::regex::flag_type regex_flags_for(
+        const RegexPattern& pattern, std::regex::flag_type base_flags) {
+        return pattern.case_insensitive ? base_flags | std::regex::icase : base_flags;
+    }
+
     Config config_;
     std::string launcher_package_;
     std::vector<CompiledProcessRule> compiled_rules_;
@@ -310,7 +337,7 @@ private:
                         result.uclamp_max = ctr.rule.uclamp_max;
                         result.cpu_share = ctr.rule.cpu_share;
                         result.enable_limit = ctr.rule.enable_limit;
-                        result.thread_rule_index = static_cast<int>(i);
+                        result.thread_rule_index = static_cast<int>(ctr.source_rule_index);
                         LOG_T("ThreadMatcher", std::string(log_label) + " '" + thread_name + "' matched MAIN_THREAD rule '"
                               + matched_rule->rule.name + "' -> ac=" + ctr.rule.affinity_class
                               + ", pc=" + ctr.rule.prio_class);
@@ -323,7 +350,7 @@ private:
                         result.uclamp_max = ctr.rule.uclamp_max;
                         result.cpu_share = ctr.rule.cpu_share;
                         result.enable_limit = ctr.rule.enable_limit;
-                        result.thread_rule_index = static_cast<int>(i);
+                        result.thread_rule_index = static_cast<int>(ctr.source_rule_index);
                         LOG_T("ThreadMatcher", std::string(log_label) + " '" + thread_name + "' matched rule '"
                               + matched_rule->rule.name + "' -> ac=" + ctr.rule.affinity_class
                               + ", pc=" + ctr.rule.prio_class);
@@ -394,9 +421,7 @@ private:
     };
 
     static constexpr int64_t kProcessCacheTTLMs = 100;
-    static constexpr int64_t kProcessCacheTTLMsHighLoad = 50;
-    static constexpr int64_t kProcessCacheTTLMsLowLoad = 200;
-    
+
     // 细粒度锁：分桶策略
     static constexpr size_t kCacheBuckets = 16;
     std::unordered_map<std::string, ProcessCacheEntry> process_cache_[kCacheBuckets];
@@ -406,31 +431,14 @@ private:
         return std::hash<std::string>{}(key) % kCacheBuckets;
     }
 
-    // 动态调整缓存 TTL，根据系统负载
-    int64_t get_dynamic_ttl() const {
-        // 简化的负载估算：基于缓存条目数量
-        // 实际可以使用 /proc/loadavg 或其他方式获取系统负载
-        size_t total_size = 0;
-        for (size_t i = 0; i < kCacheBuckets; ++i) {
-            total_size += process_cache_[i].size();
-        }
-        if (total_size > 1000) {
-            return kProcessCacheTTLMsHighLoad;
-        } else if (total_size > 500) {
-            return kProcessCacheTTLMs;
-        }
-        return kProcessCacheTTLMsLowLoad;
-    }
-
     std::optional<ProcessCacheEntry> get_cached_process_result(const std::string& proc_name) {
         size_t bucket = get_cache_bucket(proc_name);
         std::lock_guard<std::mutex> lock(process_cache_mutex_[bucket]);
         auto it = process_cache_[bucket].find(proc_name);
         if (it != process_cache_[bucket].end()) {
-            int64_t ttl = get_dynamic_ttl();
             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - it->second.timestamp).count();
-            if (elapsed_ms < ttl) {
+            if (elapsed_ms < kProcessCacheTTLMs) {
                 return it->second;
             }
             process_cache_[bucket].erase(it);

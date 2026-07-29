@@ -178,6 +178,20 @@
 | `cpu_share` | int | - | cpu.shares 值（0-1024），需 enable_limit |
 | `enable_limit` | bool | false | 启用 uclamp/cpu_share 限制 |
 
+### 正则大小写匹配
+
+正则默认遵循 C++ ECMAScript 语法并区分大小写。除全局 `case_insensitive: true` 外，进程 `regex`、`comm_regex` 和线程 `k` 可在**开头**加 `(?i)`，仅对该条规则启用忽略大小写匹配：
+
+```json
+{
+  "k": "(?i)network",
+  "ac": "0-4",
+  "pc": "net"
+}
+```
+
+`(?i)` 仅支持作为整个正则的开头前缀；实现会移除前缀，并使用 `std::regex::icase` 编译余下表达式。`foo(?i)bar`、`(?i:foo)` 等 PCRE 风格的内联或分组标志不受支持。若同时设置 `case_insensitive: true`，所有规则均忽略大小写，`(?i)` 没有额外效果。
+
 ## 特殊宏
 
 | 宏 | 替换为 |
