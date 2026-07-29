@@ -67,12 +67,20 @@ public:
 
     LogLevel get_module_level(const std::string& module) const { 
         std::lock_guard<std::mutex> lock(mutex_); 
+        return get_module_level_unlocked(module);
+    }
+
+private:
+    // 调用方必须已持有 mutex_
+    LogLevel get_module_level_unlocked(const std::string& module) const { 
         auto it = module_levels_.find(module); 
         if (it != module_levels_.end()) {
             return it->second;
         }
         return level_;
     }
+
+public:
 
     void enable_structured_logging(bool enable) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -86,7 +94,7 @@ public:
     void log(LogLevel level, const std::string& tag, const std::string& msg, bool structured) { 
         std::lock_guard<std::mutex> lock(mutex_);
 
-        LogLevel effective_level = get_module_level(tag);
+        LogLevel effective_level = get_module_level_unlocked(tag);
         if (level > effective_level) return;
 
         std::string level_str; 
