@@ -29,6 +29,7 @@ struct DispatchTask {
     int pid;
     int tid;
     uint64_t process_start_time;
+    uint64_t thread_start_time;
     std::string thread_name;
     ProcessState state;
     std::string cpuset_base;
@@ -37,6 +38,31 @@ struct DispatchTask {
 };
 
 class ScanWorker {
+    struct TaskKey {
+        int pid;
+        int tid;
+        uint64_t process_start_time;
+        uint64_t thread_start_time;
+
+        bool operator==(const TaskKey& other) const {
+            return pid == other.pid && tid == other.tid
+                && process_start_time == other.process_start_time
+                && thread_start_time == other.thread_start_time;
+        }
+    };
+
+    struct TaskKeyHash {
+        size_t operator()(const TaskKey& key) const {
+            size_t hash = std::hash<int>{}(key.pid);
+            hash ^= std::hash<int>{}(key.tid) + 0x9e3779b9U + (hash << 6) + (hash >> 2);
+            hash ^= std::hash<uint64_t>{}(key.process_start_time) + 0x9e3779b9U
+                + (hash << 6) + (hash >> 2);
+            hash ^= std::hash<uint64_t>{}(key.thread_start_time) + 0x9e3779b9U
+                + (hash << 6) + (hash >> 2);
+            return hash;
+        }
+    };
+
 public:
     explicit ScanWorker(const std::string& name) 
         : name_(name), running_(false), started_(false),
@@ -70,8 +96,15 @@ public:
             return false;
         }
         
-        running_ = true;
-        thread_ = std::thread(&ScanWorker::worker_loop, this);
+        running_.store(true);
+        started_.store(true);
+        try {
+            thread_ = std::thread(&ScanWorker::worker_loop, this);
+        } catch (...) {
+            started_.store(false);
+            running_.store(false);
+            throw;
+        }
         
         #ifdef __linux__
         const int setname_result = pthread_setname_np(thread_.native_handle(), name_.c_str());
@@ -82,7 +115,6 @@ public:
         #endif
         
         LOG_I("ScanWorker", name_ + " started");
-        started_ = true;
         return true;
     }
     
@@ -96,9 +128,9 @@ public:
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            std::queue<DispatchTask> empty;
+            std::queue<TaskKey> empty;
             task_queue_.swap(empty);
-            queued_tasks_.clear();
+            pending_tasks_.clear();
         }
 
         if (was_started) LOG_I("ScanWorker", name_ + " stopped");
@@ -106,21 +138,35 @@ public:
     
     bool is_running() const { return started_.load(); }
     
-    void enqueue(const DispatchTask& task) {
+    enum class EnqueueResult {
+        Queued,
+        Updated,
+        QueueFull,
+        Stopped
+    };
+
+    EnqueueResult enqueue(const DispatchTask& task) {
         const TaskKey key = task_key(task);
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (queued_tasks_.count(key) > 0) {
-                return;
+            if (!running_.load()) {
+                return EnqueueResult::Stopped;
+            }
+            const auto pending = pending_tasks_.find(key);
+            if (pending != pending_tasks_.end()) {
+                // Preserve one queue node while replacing stale state with the newest task.
+                pending->second = task;
+                return EnqueueResult::Updated;
             }
             if (task_queue_.size() >= kMaxQueuedTasks) {
                 LOG_W("ScanWorker", name_ + " task queue full, dropping TID " + std::to_string(task.tid));
-                return;
+                return EnqueueResult::QueueFull;
             }
-            task_queue_.push(task);
-            queued_tasks_.insert(key);
+            task_queue_.push(key);
+            pending_tasks_.emplace(key, task);
         }
         cv_.notify_one();
+        return EnqueueResult::Queued;
     }
 
 private:
@@ -129,29 +175,8 @@ private:
     std::atomic<bool> started_;
     static constexpr size_t kMaxQueuedTasks = 4096;
     std::thread thread_;
-    std::queue<DispatchTask> task_queue_;
-    struct TaskKey {
-        int pid;
-        int tid;
-        uint64_t process_start_time;
-
-        bool operator==(const TaskKey& other) const {
-            return pid == other.pid && tid == other.tid
-                && process_start_time == other.process_start_time;
-        }
-    };
-
-    struct TaskKeyHash {
-        size_t operator()(const TaskKey& key) const {
-            size_t hash = std::hash<int>{}(key.pid);
-            hash ^= std::hash<int>{}(key.tid) + 0x9e3779b9U + (hash << 6) + (hash >> 2);
-            hash ^= std::hash<uint64_t>{}(key.process_start_time) + 0x9e3779b9U
-                + (hash << 6) + (hash >> 2);
-            return hash;
-        }
-    };
-
-    std::unordered_set<TaskKey, TaskKeyHash> queued_tasks_;
+    std::queue<TaskKey> task_queue_;
+    std::unordered_map<TaskKey, DispatchTask, TaskKeyHash> pending_tasks_;
     std::mutex mutex_;
     std::condition_variable cv_;
     
@@ -162,45 +187,110 @@ private:
     std::shared_ptr<ThreadCache> cache_;
 
     static TaskKey task_key(const DispatchTask& task) {
-        return {task.pid, task.tid, task.process_start_time};
+        return {task.pid, task.tid, task.process_start_time, task.thread_start_time};
     }
     
-    // 抖动抑制：记录每个 tid 的上次调度时间
     static constexpr int64_t kMinScheduleIntervalMs = 200;
     static constexpr int64_t kScheduleCleanupIntervalMs = 5000;
     static constexpr size_t kScheduleCleanupThreshold = 500;
-    std::unordered_map<int, std::chrono::steady_clock::time_point> last_schedule_time_;
+    static constexpr int64_t kCgroupCheckIntervalMs = 1000;
+    std::unordered_map<TaskKey, std::chrono::steady_clock::time_point, TaskKeyHash>
+        last_schedule_time_;
+    std::unordered_map<TaskKey, ProcessState, TaskKeyHash> last_schedule_state_;
+    std::unordered_map<TaskKey, std::chrono::steady_clock::time_point, TaskKeyHash>
+        next_cgroup_check_time_;
     mutable std::mutex last_schedule_mutex_;
     size_t schedule_counter_ = 0;
-    
+    size_t cgroup_check_counter_ = 0;
+
     void cleanup_expired_schedule_times(const std::chrono::steady_clock::time_point& now) {
         for (auto it = last_schedule_time_.begin(); it != last_schedule_time_.end(); ) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count();
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - it->second).count();
             if (elapsed > kScheduleCleanupIntervalMs) {
+                last_schedule_state_.erase(it->first);
                 it = last_schedule_time_.erase(it);
             } else {
                 ++it;
             }
         }
+        for (auto it = next_cgroup_check_time_.begin(); it != next_cgroup_check_time_.end(); ) {
+            if (now - it->second > std::chrono::milliseconds(kScheduleCleanupIntervalMs)) {
+                it = next_cgroup_check_time_.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
-    
-    // 检查是否需要跳过调度（抖动抑制）
-    bool should_skip_schedule(int tid) {
+
+    bool should_skip_schedule(const DispatchTask& task) {
         std::lock_guard<std::mutex> lock(last_schedule_mutex_);
-        auto now = std::chrono::steady_clock::now();
-        auto it = last_schedule_time_.find(tid);
-        if (it != last_schedule_time_.end()) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count();
+        const auto now = std::chrono::steady_clock::now();
+        const TaskKey key = task_key(task);
+        const auto time_it = last_schedule_time_.find(key);
+        const auto state_it = last_schedule_state_.find(key);
+        const bool same_state = state_it != last_schedule_state_.end()
+            && state_it->second == task.state;
+        if (task.state != ProcessState::TOP && same_state
+            && time_it != last_schedule_time_.end()) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - time_it->second).count();
             if (elapsed < kMinScheduleIntervalMs) {
                 return true;
             }
         }
-        last_schedule_time_[tid] = now;
+        last_schedule_time_[key] = now;
+        last_schedule_state_[key] = task.state;
         if (++schedule_counter_ >= kScheduleCleanupThreshold) {
             schedule_counter_ = 0;
             cleanup_expired_schedule_times(now);
         }
         return false;
+    }
+
+    bool should_check_cgroup(const DispatchTask& task) {
+        std::lock_guard<std::mutex> lock(last_schedule_mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        const TaskKey key = task_key(task);
+        auto it = next_cgroup_check_time_.find(key);
+        if (it == next_cgroup_check_time_.end()) {
+            const auto stagger_ms = static_cast<int64_t>(
+                TaskKeyHash{}(key) % static_cast<size_t>(kCgroupCheckIntervalMs));
+            next_cgroup_check_time_[key] = now + std::chrono::milliseconds(stagger_ms);
+            return stagger_ms == 0;
+        }
+        if (now < it->second) {
+            return false;
+        }
+        it->second = now + std::chrono::milliseconds(kCgroupCheckIntervalMs);
+        if (++cgroup_check_counter_ >= kScheduleCleanupThreshold) {
+            cgroup_check_counter_ = 0;
+            cleanup_expired_schedule_times(now);
+        }
+        return true;
+    }
+
+    bool is_cgroup_changed(const DispatchTask& task, const MatchResult& result) {
+        const bool check_cpuset = !result.affinity_class.empty()
+            && result.affinity_class != "auto" && !result.cpumask_name.empty();
+        const bool check_cpuctl = result.enable_limit && result.thread_rule_index >= 0;
+        if ((!check_cpuset && !check_cpuctl) || !should_check_cgroup(task)) {
+            return false;
+        }
+
+        const FileUtils::ThreadCgroupPaths paths =
+            FileUtils::get_thread_cgroup_paths_uncached(task.pid, task.tid);
+        if (!paths.readable) {
+            // Unknown is conservatively treated as drift; task identity is revalidated
+            // before applying and no stale success is cached.
+            return true;
+        }
+        if (check_cpuset && paths.cpuset != "/ReUperf_" + result.cpumask_name) {
+            return true;
+        }
+        const std::string expected_cpuctl = "/ReUperf/" + result.matched_rule_name
+            + "/A" + std::to_string(result.thread_rule_index + 1);
+        return check_cpuctl && paths.cpuctl != expected_cpuctl;
     }
     
     void worker_loop() {
@@ -217,9 +307,14 @@ private:
                 }
                 
                 if (!task_queue_.empty()) {
-                    task = task_queue_.front();
+                    const TaskKey key = task_queue_.front();
                     task_queue_.pop();
-                    queued_tasks_.erase(task_key(task));
+                    const auto pending = pending_tasks_.find(key);
+                    if (pending == pending_tasks_.end()) {
+                        continue;
+                    }
+                    task = std::move(pending->second);
+                    pending_tasks_.erase(pending);
                 } else {
                     continue;
                 }
@@ -252,17 +347,14 @@ private:
         baseline.has_scheduler = prio.capture_scheduler_baseline(
             task.tid, baseline.scheduler_policy, baseline.scheduler_priority, baseline.nice);
 
-        const std::string cpuset_path = FileUtils::get_thread_cgroup_path(task.pid, task.tid, "cpuset");
-        if (!cpuset_path.empty()) {
-            baseline.cpuset_path = "/dev/cpuset" + cpuset_path;
+        const FileUtils::ThreadCgroupPaths cgroups =
+            FileUtils::get_thread_cgroup_paths_uncached(task.pid, task.tid);
+        if (!cgroups.cpuset.empty()) {
+            baseline.cpuset_path = "/dev/cpuset" + cgroups.cpuset;
             baseline.has_cpuset_path = true;
         }
-        std::string cpuctl_path = FileUtils::get_thread_cgroup_path(task.pid, task.tid, "cpu");
-        if (cpuctl_path.empty()) {
-            cpuctl_path = FileUtils::get_thread_cgroup_path(task.pid, task.tid, "cpuctl");
-        }
-        if (!cpuctl_path.empty()) {
-            baseline.cpuctl_path = "/dev/cpuctl" + cpuctl_path;
+        if (!cgroups.cpuctl.empty()) {
+            baseline.cpuctl_path = "/dev/cpuctl" + cgroups.cpuctl;
             baseline.has_cpuctl_path = true;
         }
         cache.set_baseline(task.pid, task.tid, std::move(baseline));
@@ -328,15 +420,30 @@ private:
         const bool cpuctl_applied = priority_applied
             && cpuctl.apply_with_result(task.pid, task.tid, result);
         if (cpuctl_applied) {
-            cache.update_applied_result(task.pid, task.tid, result);
+            if (is_current_task_identity(task)) {
+                cache.update_applied_result(task.pid, task.tid, result);
+            } else {
+                cache.erase_thread_if_identity(task.pid, task.tid, task.process_start_time,
+                                               task.thread_start_time);
+            }
             return;
         }
 
         LOG_W("ScanWorker", name_ + " rolling back incomplete scheduling for tid "
               + std::to_string(task.tid));
-        // CpusetSetter may have changed affinity before its cgroup migration failed.
-        // Restore the complete baseline so the next retry starts from a known state.
-        restore_baseline(task.pid, task.tid, cache, cpuset, prio, cpuctl);
+        // Never restore an old baseline onto a recycled TID.
+        if (is_current_task_identity(task)) {
+            restore_baseline(task.pid, task.tid, cache, cpuset, prio, cpuctl);
+        } else {
+            cache.erase_thread_if_identity(task.pid, task.tid, task.process_start_time,
+                                           task.thread_start_time);
+        }
+    }
+
+    bool is_current_task_identity(const DispatchTask& task) const {
+        return FileUtils::get_process_start_time(task.pid) == task.process_start_time
+            && FileUtils::get_thread_start_time(task.pid, task.tid) == task.thread_start_time
+            && FileUtils::is_thread_in_process(task.pid, task.tid);
     }
 
     void process_dispatch_task(const DispatchTask& task) {
@@ -349,19 +456,19 @@ private:
             LOG_E("ScanWorker", name_ + " configs null during task processing");
             return;
         }
-        if (FileUtils::get_process_start_time(task.pid) != task.process_start_time
-            || !FileUtils::is_thread_in_process(task.pid, task.tid)) {
+        if (!is_current_task_identity(task)) {
             LOG_D("ScanWorker", name_ + " dropping stale task for pid " + std::to_string(task.pid)
                   + ", tid " + std::to_string(task.tid));
-            cache->erase_thread(task.pid, task.tid);
+            cache->erase_thread_if_identity(task.pid, task.tid, task.process_start_time,
+                                            task.thread_start_time);
             return;
         }
-        if (should_skip_schedule(task.tid)) {
+        if (should_skip_schedule(task)) {
             return;
         }
 
         if (const auto entry = cache->lookup(task.pid, task.tid, task.process_start_time,
-                                             task.thread_name, task.cmdline, task.state)) {
+                                             task.thread_start_time, task.thread_name, task.cmdline, task.state)) {
             const auto applied = cache->get_applied_result(task.pid, task.tid);
             if (applied && is_result_equal(*applied, entry->result)) {
                 if (!needs_managed_state(*applied, *matcher)) {
@@ -371,13 +478,15 @@ private:
                 if (!applied->affinity_class.empty() && applied->affinity_class != "auto") {
                     const auto expected_cpus = cpuset->get_cpus_for_affinity(
                         applied->affinity_class, applied->effective_state);
-                    affinity_changed = CpuMask::is_affinity_changed_from_status(task.tid, expected_cpus);
+                    affinity_changed = CpuMask::is_affinity_changed(task.tid, expected_cpus);
                 }
                 const int expected_prio = matcher->get_prio_value(
                     applied->prio_class, applied->effective_state);
                 const bool sched_changed = expected_prio != 0
                     && prio->is_sched_changed(task.tid, expected_prio);
-                if (!affinity_changed && !sched_changed) {
+                const bool cgroup_changed = !affinity_changed && !sched_changed
+                    && is_cgroup_changed(task, *applied);
+                if (!affinity_changed && !sched_changed && !cgroup_changed) {
                     return;
                 }
             }
@@ -389,7 +498,8 @@ private:
         const MatchResult result = matcher->match(task.proc_name, task.thread_name,
                                                    task.state, task.pid, task.cmdline);
         const std::string cpuctl_base = cpuctl->get_cpuctl_base(result.effective_state);
-        cache->update(task.pid, task.tid, task.process_start_time, task.thread_name, task.cmdline,
+        cache->update(task.pid, task.tid, task.process_start_time, task.thread_start_time,
+                      task.thread_name, task.cmdline,
                       task.state, result, task.cpuset_base, cpuctl_base);
         apply_result(task, result, task.cpuset_base, *matcher, *cache,
                      *cpuset, *prio, *cpuctl);

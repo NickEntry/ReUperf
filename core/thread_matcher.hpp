@@ -8,6 +8,7 @@
 #include <optional>
 #include <unordered_map>
 #include <chrono>
+#include <cstring>
 #include <mutex>
 #include <limits>
 #include "../config/config_types.hpp"
@@ -37,7 +38,10 @@ inline bool is_result_equal(const MatchResult& a, const MatchResult& b) {
            a.enable_limit == b.enable_limit &&
            a.uclamp_max == b.uclamp_max &&
            a.cpu_share == b.cpu_share &&
-           a.thread_rule_index == b.thread_rule_index;
+           a.thread_rule_index == b.thread_rule_index &&
+           a.matched_rule_name == b.matched_rule_name &&
+           a.pinned == b.pinned &&
+           a.topfore == b.topfore;
 }
 
 struct CompiledThreadRule {
@@ -135,7 +139,7 @@ public:
     }
 
     std::vector<int> get_cpus_for_affinity(const std::string& affinity_class,
-                                           ProcessState effective_state) {
+                                           ProcessState effective_state) const {
         std::string cpumask_name = get_cpumask_name_for_affinity(affinity_class, effective_state);
         if (cpumask_name.empty()) {
             return {};
@@ -151,7 +155,7 @@ public:
     }
 
     std::string get_cpumask_name_for_affinity(const std::string& affinity_class,
-                                              ProcessState effective_state) {
+                                              ProcessState effective_state) const {
         if (affinity_class.empty() || affinity_class == "auto") {
             return "";
         }
@@ -170,7 +174,7 @@ public:
         return "";
     }
 
-    int get_prio_value(const std::string& prio_class, ProcessState state) {
+    int get_prio_value(const std::string& prio_class, ProcessState state) const {
         if (prio_class.empty() || prio_class == "auto") {
             return 0;
         }
@@ -364,12 +368,25 @@ private:
     // Design: /HOME_PACKAGE/ and /MAIN_THREAD/ macros use exact-match replacement only.
     // Partial/substring macro expansion is intentionally not supported to keep regex
     // semantics predictable and avoid ambiguity with user-supplied regex patterns.
+    static std::string escape_regex_literal(const std::string& value) {
+        static constexpr const char* kMetacharacters = R"(\^$.|?*+()[]{} )";
+        std::string escaped;
+        escaped.reserve(value.size() * 2);
+        for (char character : value) {
+            if (character != ' ' && std::strchr(kMetacharacters, character) != nullptr) {
+                escaped.push_back('\\');
+            }
+            escaped.push_back(character);
+        }
+        return escaped;
+    }
+
     std::string expand_process_regex(const std::string& regex_str,
                                      const std::string& launcher,
                                      const std::string& /*main_thread*/) {
         std::string result = regex_str;
         if (result == "/HOME_PACKAGE/") {
-            result = "^" + launcher + "$";
+            result = "^" + escape_regex_literal(launcher) + "$";
         }
         return result;
     }

@@ -7,6 +7,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <unordered_set>
 #include "config_types.hpp"
 #include "../utils/logger.hpp"
 #include "../utils/cpu_mask.hpp"
@@ -54,17 +55,58 @@ public:
 
 private:
     static bool is_safe_cgroup_component(const std::string& name) {
-        if (name.empty() || name == "." || name == "..") {
+        if (name.empty() || name == "." || name == ".." || name.size() > 128) {
+            return false;
+        }
+        const auto is_ascii_space = [](unsigned char c) {
+            return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+                || c == '\f' || c == '\v';
+        };
+        if (is_ascii_space(static_cast<unsigned char>(name.front()))
+            || is_ascii_space(static_cast<unsigned char>(name.back()))) {
             return false;
         }
 
-        for (unsigned char c : name) {
-            // This is intentionally a blacklist for cgroup path components, not an
-            // ASCII-only whitelist: UTF-8 names (including Chinese and other languages)
-            // remain valid. Reject only path syntax and control characters.
-            if (c < 0x20 || c == 0x7f || c == '/' || c == '\\') {
+        for (size_t offset = 0; offset < name.size();) {
+            const unsigned char lead = static_cast<unsigned char>(name[offset]);
+            uint32_t codepoint = 0;
+            size_t width = 0;
+            if (lead < 0x80) {
+                codepoint = lead;
+                width = 1;
+            } else if ((lead & 0xe0) == 0xc0 && offset + 1 < name.size()) {
+                codepoint = lead & 0x1f;
+                width = 2;
+            } else if ((lead & 0xf0) == 0xe0 && offset + 2 < name.size()) {
+                codepoint = lead & 0x0f;
+                width = 3;
+            } else if ((lead & 0xf8) == 0xf0 && offset + 3 < name.size()) {
+                codepoint = lead & 0x07;
+                width = 4;
+            } else {
                 return false;
             }
+            for (size_t index = 1; index < width; ++index) {
+                const unsigned char byte = static_cast<unsigned char>(name[offset + index]);
+                if ((byte & 0xc0) != 0x80) return false;
+                codepoint = (codepoint << 6) | (byte & 0x3f);
+            }
+            const bool overlong = (width == 2 && codepoint < 0x80)
+                || (width == 3 && codepoint < 0x800)
+                || (width == 4 && codepoint < 0x10000);
+            const bool unicode_space = codepoint == 0x85 || codepoint == 0xa0
+                || codepoint == 0x1680 || (codepoint >= 0x2000 && codepoint <= 0x200a)
+                || codepoint == 0x2028 || codepoint == 0x2029 || codepoint == 0x202f
+                || codepoint == 0x205f || codepoint == 0x3000;
+            const bool invisible = codepoint <= 0x1f || codepoint == 0x7f || unicode_space
+                || (codepoint >= 0x200b && codepoint <= 0x200f)
+                || (codepoint >= 0x202a && codepoint <= 0x202e) || codepoint == 0x2060
+                || (codepoint >= 0x2066 && codepoint <= 0x2069) || codepoint == 0xfeff;
+            if (overlong || codepoint > 0x10ffff || (codepoint >= 0xd800 && codepoint <= 0xdfff)
+                || invisible || codepoint == '/' || codepoint == '\\' || codepoint == ':') {
+                return false;
+            }
+            offset += width;
         }
         return true;
     }
@@ -117,8 +159,9 @@ private:
         if (sched.contains("refresh_interval_ms") && sched["refresh_interval_ms"].is_number_integer()) {
             refresh_interval = sched["refresh_interval_ms"].get<int>();
         }
-        if (refresh_interval <= 0) {
-            LOG_W("ConfigParser", "Invalid refresh_interval_ms " + std::to_string(refresh_interval) + ", using default 2000");
+        if (refresh_interval <= 0 || refresh_interval > 600000) {
+            LOG_W("ConfigParser", "Invalid refresh_interval_ms " + std::to_string(refresh_interval)
+                  + ", expected 1-600000; using default 2000");
             refresh_interval = 2000;
         }
         cfg.refresh_interval_ms = refresh_interval;
@@ -127,8 +170,9 @@ private:
         if (sched.contains("highspeed_sched_ms") && sched["highspeed_sched_ms"].is_number_integer()) {
             highspeed = sched["highspeed_sched_ms"].get<int>();
         }
-        if (highspeed <= 0) {
-            LOG_W("ConfigParser", "Invalid highspeed_sched_ms " + std::to_string(highspeed) + ", using default 300");
+        if (highspeed <= 0 || highspeed > 60000) {
+            LOG_W("ConfigParser", "Invalid highspeed_sched_ms " + std::to_string(highspeed)
+                  + ", expected 1-60000; using default 300");
             highspeed = 300;
         }
         cfg.highspeed_sched_ms = highspeed;
@@ -321,6 +365,7 @@ private:
             return;
         }
 
+        std::unordered_set<std::string> rule_names;
         for (const auto& rule : *rules_it) {
             if (!rule.is_object()) {
                 LOG_W("ConfigParser", "Ignoring non-object process rule");
@@ -333,6 +378,10 @@ private:
             }
             if (!is_safe_cgroup_component(pr.name)) {
                 LOG_W("ConfigParser", "Ignoring process rule with unsafe name: " + pr.name);
+                continue;
+            }
+            if (!rule_names.insert(pr.name).second) {
+                LOG_W("ConfigParser", "Ignoring duplicate process rule name: " + pr.name);
                 continue;
             }
             if (!rule.contains("regex") || !rule["regex"].is_string()) {

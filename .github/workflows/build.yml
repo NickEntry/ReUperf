@@ -99,3 +99,26 @@ jobs:
         path: out/ReUperf-*.zip
         retention-days: 30
         if-no-files-found: error
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v5
+
+    - name: Install Build Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake ninja-build nlohmann-json3-dev
+
+    - name: Configure Host Tests
+      run: |
+        cmake -S . -B build-host -G Ninja \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DBUILD_TESTING=ON \
+          -DREUPERF_ENABLE_SANITIZERS=ON
+
+    - name: Build Host Tests
+      run: cmake --build build-host --parallel
+
+    - name: Run Host Tests
+      run: ctest --test-dir build-host --output-on-failure

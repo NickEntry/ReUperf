@@ -30,6 +30,7 @@ struct StoredThreadBaseline {
     int pid;
     int tid;
     uint64_t process_start_time;
+    uint64_t thread_start_time;
     ThreadBaseline baseline;
 };
 
@@ -37,6 +38,7 @@ struct ThreadCacheEntry {
     int pid;
     int tid;
     uint64_t process_start_time;
+    uint64_t thread_start_time;
     std::string thread_name;
     std::string cmdline;
     ProcessState actual_state;
@@ -58,11 +60,13 @@ struct CacheKeyHash {
 class ThreadCache {
 public:
     std::optional<ThreadCacheEntry> lookup(int pid, int tid, uint64_t process_start_time,
+                                           uint64_t thread_start_time,
                                            const std::string& thread_name, const std::string& cmdline,
                                            ProcessState actual_state) {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto it = cache_.find(std::make_pair(pid, tid));
-        if (it == cache_.end() || it->second.process_start_time != process_start_time) {
+        if (it == cache_.end() || it->second.process_start_time != process_start_time
+            || it->second.thread_start_time != thread_start_time) {
             return std::nullopt;
         }
         if (it->second.thread_name == thread_name && it->second.cmdline == cmdline
@@ -72,13 +76,15 @@ public:
         return std::nullopt;
     }
 
-    void update(int pid, int tid, uint64_t process_start_time, const std::string& thread_name,
+    void update(int pid, int tid, uint64_t process_start_time, uint64_t thread_start_time,
+                const std::string& thread_name,
                 const std::string& cmdline, ProcessState actual_state, const MatchResult& result,
                 const std::string& cpuset_base, const std::string& cpuctl_base) {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto key = std::make_pair(pid, tid);
         const auto it = cache_.find(key);
-        if (it != cache_.end() && it->second.process_start_time == process_start_time) {
+        if (it != cache_.end() && it->second.process_start_time == process_start_time
+            && it->second.thread_start_time == thread_start_time) {
             it->second.thread_name = thread_name;
             it->second.cmdline = cmdline;
             it->second.actual_state = actual_state;
@@ -87,7 +93,8 @@ public:
             it->second.cpuctl_base = cpuctl_base;
             return;
         }
-        cache_[key] = ThreadCacheEntry{pid, tid, process_start_time, thread_name, cmdline,
+        cache_[key] = ThreadCacheEntry{pid, tid, process_start_time, thread_start_time,
+            thread_name, cmdline,
             actual_state, result, std::nullopt, cpuset_base, cpuctl_base, std::nullopt};
     }
 
@@ -107,12 +114,6 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         const auto it = cache_.find(std::make_pair(pid, tid));
         if (it != cache_.end()) it->second.applied_result.reset();
-    }
-
-    bool has_baseline(int pid, int tid) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const auto it = cache_.find(std::make_pair(pid, tid));
-        return it != cache_.end() && it->second.baseline.has_value();
     }
 
     void set_baseline(int pid, int tid, ThreadBaseline baseline) {
@@ -157,28 +158,51 @@ public:
         if (it != cache_.end()) it->second.baseline.reset();
     }
 
+    std::set<int> get_pids_with_baselines() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::set<int> pids;
+        for (const auto& [key, entry] : cache_) {
+            if (entry.baseline) {
+                pids.insert(entry.pid);
+            }
+        }
+        return pids;
+    }
+
     std::vector<StoredThreadBaseline> get_all_baselines() const {
         std::lock_guard<std::mutex> lock(mutex_);
         std::vector<StoredThreadBaseline> baselines;
         baselines.reserve(cache_.size());
         for (const auto& [key, entry] : cache_) {
             if (entry.baseline) {
-                baselines.push_back({entry.pid, entry.tid, entry.process_start_time, *entry.baseline});
+                baselines.push_back({entry.pid, entry.tid, entry.process_start_time,
+                    entry.thread_start_time, *entry.baseline});
             }
         }
         return baselines;
     }
 
     void retain_live_threads(const std::map<int, uint64_t>& live_processes,
-                             const std::set<std::pair<int, int>>& live_threads) {
+                             const std::map<std::pair<int, int>, uint64_t>& live_threads) {
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto it = cache_.begin(); it != cache_.end();) {
             const auto process = live_processes.find(it->second.pid);
-            if (process == live_processes.end() || process->second != it->second.process_start_time
-                || live_threads.count(it->first) == 0) {
+            if (process == live_processes.end() || process->second != it->second.process_start_time) {
+                // The owning process is confirmed dead or recycled, so restoration is unsafe.
                 it = cache_.erase(it);
             } else {
-                ++it;
+                const auto live_thread = live_threads.find(it->first);
+                if (live_thread != live_threads.end()
+                    && live_thread->second != it->second.thread_start_time) {
+                    // TID was recycled inside the same process; never restore old state to it.
+                    it = cache_.erase(it);
+                } else if (live_thread == live_threads.end() && !it->second.baseline) {
+                    it = cache_.erase(it);
+                } else {
+                    // A transient /proc miss must not discard the only restoration baseline
+                    // for a still-live process. The next dispatch revalidates thread identity.
+                    ++it;
+                }
             }
         }
     }
@@ -197,9 +221,14 @@ public:
         }
     }
 
-    void erase_thread(int pid, int tid) {
+    void erase_thread_if_identity(int pid, int tid, uint64_t process_start_time,
+                                  uint64_t thread_start_time) {
         std::lock_guard<std::mutex> lock(mutex_);
-        cache_.erase(std::make_pair(pid, tid));
+        const auto it = cache_.find(std::make_pair(pid, tid));
+        if (it != cache_.end() && it->second.process_start_time == process_start_time
+            && it->second.thread_start_time == thread_start_time) {
+            cache_.erase(it);
+        }
     }
 
     void reset_for_pid(int pid) {

@@ -11,6 +11,7 @@
 #include <sched.h>
 #include <cstring>
 #include <dirent.h>
+#include <sys/stat.h>
 #include <cctype>
 #include "logger.hpp"
 #include "file_utils.hpp"
@@ -40,10 +41,10 @@ public:
 
     static std::string to_string(const std::vector<int>& cpus) {
         if (cpus.empty()) return "";
-        
+
         std::vector<int> sorted = cpus;
         std::sort(sorted.begin(), sorted.end());
-        
+
         std::ostringstream oss;
         for (size_t i = 0; i < sorted.size(); ++i) {
             if (i > 0) {
@@ -68,7 +69,7 @@ public:
 
     static bool set_affinity(int tid, const cpu_set_t& set) {
         if (sched_setaffinity(tid, sizeof(cpu_set_t), &set) != 0) {
-            LOG_E("CpuMask", "sched_setaffinity failed for tid " + std::to_string(tid) 
+            LOG_E("CpuMask", "sched_setaffinity failed for tid " + std::to_string(tid)
                   + ": " + std::string(strerror(errno)));
             return false;
         }
@@ -93,15 +94,15 @@ public:
             LOG_W("CpuMask", "Cannot read status for tid " + std::to_string(tid));
             return {};
         }
-        
+
         std::istringstream iss(content);
         std::string line;
-        
+
         while (std::getline(iss, line)) {
             if (line.compare(0, 17, "Cpus_allowed_list") == 0) {
                 size_t pos = line.find(':');
                 if (pos == std::string::npos) continue;
-                
+
                 const std::string value = line.substr(pos + 1);
                 std::vector<int> cpus;
                 size_t i = 0;
@@ -149,29 +150,30 @@ public:
                 return cpus;
             }
         }
-        
+
         LOG_W("CpuMask", "Cpus_allowed_list not found in status for tid " + std::to_string(tid));
         return {};
     }
-    
-    static bool is_affinity_changed_from_status(int tid, const std::vector<int>& expected) {
-        auto current = get_affinity_from_status(tid);
-        if (current.empty()) return true;
-        std::vector<int> sorted_current = current;
-        std::vector<int> sorted_expected = expected;
-        std::sort(sorted_current.begin(), sorted_current.end());
-        std::sort(sorted_expected.begin(), sorted_expected.end());
-        return sorted_current != sorted_expected;
-    }
-    
-    static int get_cpu_count() {
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        if (sched_getaffinity(0, sizeof(cpu_set_t), &set) != 0) {
-            LOG_W("CpuMask", "sched_getaffinity failed");
-            return 0;
+
+    static bool is_affinity_changed(int tid, const std::vector<int>& expected) {
+        if (expected.empty()) {
+            return true;
         }
-        return CPU_COUNT(&set);
+
+        cpu_set_t current;
+        CPU_ZERO(&current);
+        if (sched_getaffinity(tid, sizeof(cpu_set_t), &current) == 0) {
+            const cpu_set_t expected_set = from_vector(expected);
+            return !CPU_EQUAL(&current, &expected_set);
+        }
+
+        const auto fallback = get_affinity_from_status(tid);
+        if (fallback.empty()) {
+            return true;
+        }
+        const cpu_set_t fallback_set = from_vector(fallback);
+        const cpu_set_t expected_set = from_vector(expected);
+        return !CPU_EQUAL(&fallback_set, &expected_set);
     }
 
     static std::vector<int> detect_all_cpus() {
@@ -185,8 +187,6 @@ public:
 
         struct dirent* entry;
         while ((entry = readdir(dir)) != nullptr) {
-            if (entry->d_type != DT_DIR) continue;
-
             const char* name = entry->d_name;
             size_t len = strlen(name);
 
@@ -200,6 +200,12 @@ public:
                 }
             }
             if (!all_digits) continue;
+
+            if (entry->d_type != DT_DIR) {
+                if (entry->d_type != DT_UNKNOWN) continue;
+                struct stat st {};
+                if (fstatat(dirfd(dir), name, &st, 0) != 0 || !S_ISDIR(st.st_mode)) continue;
+            }
 
             errno = 0;
             char* end = nullptr;
@@ -218,10 +224,11 @@ public:
     static std::string get_all_cpus_string() {
         auto cpus = detect_all_cpus();
         if (cpus.empty()) {
-            LOG_W("CpuMask", "No CPUs detected, falling back to sched_getaffinity count");
-            int count = get_cpu_count();
-            for (int i = 0; i < count; i++) {
-                cpus.push_back(i);
+            LOG_W("CpuMask", "No CPUs detected, falling back to sched_getaffinity mask");
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            if (sched_getaffinity(0, sizeof(cpu_set_t), &set) == 0) {
+                cpus = to_vector(set);
             }
         }
         return to_string(cpus);

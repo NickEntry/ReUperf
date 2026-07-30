@@ -28,7 +28,27 @@ private:
     }
 
     static bool is_valid_package(const std::string& pkg) {
-        return !pkg.empty() && pkg.length() <= 128 && pkg.find(' ') == std::string::npos;
+        if (pkg.empty() || pkg.length() > 128 || pkg.front() == '.' || pkg.back() == '.') {
+            return false;
+        }
+        bool segment_start = true;
+        bool has_separator = false;
+        for (const char raw_character : pkg) {
+            const unsigned char character = static_cast<unsigned char>(raw_character);
+            if (character == '.') {
+                if (segment_start) return false;
+                segment_start = true;
+                has_separator = true;
+                continue;
+            }
+            if (segment_start) {
+                if (!std::isalpha(character)) return false;
+                segment_start = false;
+            } else if (!std::isalnum(character) && character != '_') {
+                return false;
+            }
+        }
+        return has_separator && !segment_start;
     }
 
 public:

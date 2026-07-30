@@ -44,7 +44,15 @@ public:
             on_handler_failure_ = std::move(on_handler_failure);
         }
         running_.store(true);
-        thread_ = std::thread(&EventRouter::router_loop, this);
+        try {
+            thread_ = std::thread(&EventRouter::router_loop, this);
+        } catch (...) {
+            running_.store(false);
+            std::lock_guard<std::mutex> lock(mutex_);
+            on_event_ = nullptr;
+            on_handler_failure_ = nullptr;
+            throw;
+        }
         LOG_I("EventRouter", "Started with throttle=" + std::to_string(throttle_ms_) + "ms");
     }
 
@@ -142,13 +150,16 @@ private:
             bool events_dropped = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait_for(lock, std::chrono::milliseconds(throttle_ms_), [this]() {
-                    return !running_.load() || !pending_events_.empty();
+                cv_.wait(lock, [this]() {
+                    return !running_.load() || !pending_events_.empty() || events_dropped_;
                 });
 
-                if (!running_.load() && pending_events_.empty()) {
+                if (!running_.load() && pending_events_.empty() && !events_dropped_) {
                     break;
                 }
+                const auto flush_at = std::chrono::steady_clock::now()
+                    + std::chrono::milliseconds(throttle_ms_);
+                cv_.wait_until(lock, flush_at, [this]() { return !running_.load(); });
                 events.swap(pending_events_);
                 events_dropped = events_dropped_;
                 events_dropped_ = false;

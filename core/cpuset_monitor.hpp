@@ -63,7 +63,18 @@ public:
 
         running_.store(true);
         started_.store(true);
-        thread_ = std::thread(&ProcMonitor::monitor_loop, this);
+        try {
+            thread_ = std::thread(&ProcMonitor::monitor_loop, this);
+        } catch (...) {
+            running_.store(false);
+            started_.store(false);
+            close(inotify_fd_);
+            close(stop_fd_);
+            inotify_fd_ = -1;
+            stop_fd_ = -1;
+            on_process_change_ = nullptr;
+            throw;
+        }
 #ifdef __linux__
         const int ret = pthread_setname_np(thread_.native_handle(), "ProcMonitor");
         if (ret != 0) {

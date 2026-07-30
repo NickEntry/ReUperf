@@ -19,7 +19,7 @@ public:
     CpusetSetter(ThreadMatcher& matcher)
         : matcher_(matcher) {}
 
-    std::vector<int> get_cpus_for_affinity(const std::string& affinity_class, ProcessState state) {
+    std::vector<int> get_cpus_for_affinity(const std::string& affinity_class, ProcessState state) const {
         return matcher_.get_cpus_for_affinity(affinity_class, state);
     }
 
@@ -152,8 +152,16 @@ private:
             }
         }
 
-        const bool ready = !FileUtils::read_file(path + "/cpus").empty();
-        if (!ready) LOG_W("CpusetSetter", path + "/cpus is empty or unavailable");
+        const bool cpus_ready = !FileUtils::read_file(path + "/cpus").empty();
+        const bool mems_ready = !FileUtils::read_file(path + "/mems").empty();
+        const bool tasks_ready = FileUtils::file_exists(path + "/tasks");
+        const bool ready = cpus_ready && mems_ready && tasks_ready;
+        if (!ready) {
+            LOG_W("CpusetSetter", "cpuset group is not ready: " + path
+                  + " (cpus=" + std::to_string(cpus_ready)
+                  + ", mems=" + std::to_string(mems_ready)
+                  + ", tasks=" + std::to_string(tasks_ready) + ")");
+        }
         {
             std::lock_guard<std::mutex> lock(mutex_);
             group_checks_[path] = {ready, now};

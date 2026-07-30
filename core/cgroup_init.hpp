@@ -7,6 +7,9 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "../config/config_types.hpp"
 #include "../utils/file_utils.hpp"
@@ -20,11 +23,55 @@ public:
         
         success &= init_cpuset(config);
         success &= init_cpuctl(config);
-        
+        report_stale_groups(config);
+
         return success;
     }
 
 private:
+    static std::set<std::string> list_child_directories(const std::string& path) {
+        std::set<std::string> names;
+        DIR* dir = opendir(path.c_str());
+        if (dir == nullptr) return names;
+        while (const dirent* entry = readdir(dir)) {
+            const std::string name = entry->d_name;
+            if (name == "." || name == "..") continue;
+            if (entry->d_type == DT_DIR) {
+                names.insert(name);
+                continue;
+            }
+            if (entry->d_type == DT_UNKNOWN) {
+                struct stat st {};
+                if (fstatat(dirfd(dir), name.c_str(), &st, 0) == 0 && S_ISDIR(st.st_mode)) {
+                    names.insert(name);
+                }
+            }
+        }
+        closedir(dir);
+        return names;
+    }
+
+    static void report_stale_groups(const Config& config) {
+        std::set<std::string> expected_cpuset;
+        for (const auto& [name, cpus] : config.sched.cpumask) {
+            (void)cpus;
+            expected_cpuset.insert("ReUperf_" + name);
+        }
+        for (const auto& name : list_child_directories("/dev/cpuset")) {
+            if (name.rfind("ReUperf_", 0) == 0 && expected_cpuset.count(name) == 0) {
+                LOG_W("CgroupInit", "Stale cpuset group retained for safety: /dev/cpuset/" + name);
+            }
+        }
+
+        std::set<std::string> expected_cpuctl;
+        for (const auto& rule : config.sched.rules) expected_cpuctl.insert(rule.name);
+        for (const auto& name : list_child_directories("/dev/cpuctl/ReUperf")) {
+            if (expected_cpuctl.count(name) == 0) {
+                LOG_W("CgroupInit", "Stale cpuctl group retained for safety: /dev/cpuctl/ReUperf/" + name);
+            }
+        }
+    }
+
     static bool ensure_cgroup_file_exists(const std::string& path, int max_retries = 5) {
         for (int i = 0; i < max_retries; ++i) {
             if (FileUtils::file_exists(path)) {
@@ -60,6 +107,10 @@ private:
         
         std::string base_path = "/dev/cpuset";
         std::string root_mems = FileUtils::read_file(base_path + "/mems");
+        if (root_mems.empty()) {
+            LOG_E("CgroupInit", "Root cpuset mems is empty or unreadable");
+            return false;
+        }
         int created = 0, failed = 0;
         
         // 创建各规则子组，命名格式：ReUperf_<cpumask_name>（例如 ReUperf_all）
@@ -93,14 +144,18 @@ private:
             
             LOG_D("CgroupInit", "Set " + child_path + "/cpus = " + cpus_str);
             
-            if (!root_mems.empty() && ensure_cgroup_file_exists(child_path + "/mems")) {
-                if (!FileUtils::write_kernel_control_file(child_path + "/mems", root_mems)) {
-                    LOG_W("CgroupInit", "Failed to set mems for " + child_path);
-                    failed++;
-                    continue;
-                }
-                LOG_D("CgroupInit", "Set " + child_path + "/mems = " + root_mems);
+            if (!ensure_cgroup_file_exists(child_path + "/mems")
+                || !ensure_cgroup_file_exists(child_path + "/tasks")) {
+                LOG_W("CgroupInit", "Required cpuset control files missing for " + child_path);
+                failed++;
+                continue;
             }
+            if (!FileUtils::write_kernel_control_file(child_path + "/mems", root_mems)) {
+                LOG_W("CgroupInit", "Failed to set mems for " + child_path);
+                failed++;
+                continue;
+            }
+            LOG_D("CgroupInit", "Set " + child_path + "/mems = " + root_mems);
             
             created++;
             
