@@ -22,6 +22,22 @@
       "full_scan_budget_us": 12000,
       "scan_batch_size": 32,
       "scan_batch_yield_us": 0,
+      "timing": {
+        "event_throttle_ms": 50,
+        "min_schedule_interval_ms": 200,
+        "schedule_cleanup_interval_ms": 5000,
+        "cgroup_check_interval_ms": 1000,
+        "cpuset_retry_count": 3,
+        "cpuset_retry_interval_ms": 10,
+        "cpuset_group_check_ttl_ms": 1000,
+        "process_cache_ttl_ms": 100,
+        "file_cache_ttl_ms": 100,
+        "cgroup_cache_ttl_ms": 100,
+        "monitor_initial_restart_delay_s": 1,
+        "monitor_restart_retry_delay_s": 5,
+        "config_retry_initial_delay_s": 1,
+        "config_retry_max_delay_s": 5
+      },
       "log": {
         "level": "info",
         "output": "/data/adb/ReUperf/ReUperf.log"
@@ -47,8 +63,54 @@
 | `full_scan_budget_us` | int | 12000 | 全量校准后分派线程的时间预算，范围 1000-50000 微秒。 |
 | `scan_batch_size` | int | 32 | 每读取多少个线程后检查批量让出策略，范围 1-256。 |
 | `scan_batch_yield_us` | int | 0 | 每批次主动让出 CPU 的时间，0 为关闭，范围 0-1000 微秒。 |
+| `timing` | object | 见下文 | 运行时延迟、复查、缓存与重试参数。 |
 | `log.level` | string | "info" | 日志级别：err/warn/info/debug/trace |
 | `log.output` | string | 见下文 | 日志输出文件路径 |
+
+### timing（运行时延迟与周期）
+
+所有字段均可省略；省略时保持当前稳定版行为。运行中修改配置会重建调度对象并应用新值。
+
+| 参数 | 默认值 | 有效范围 | 降低后的效果与代价 |
+|------|--------|----------|--------------------|
+| `event_throttle_ms` | 50ms | 0-5000 | 更快处理进程创建/退出事件，但事件突发时回调与锁竞争增加；0 表示不额外合并等待。 |
+| `min_schedule_interval_ms` | 200ms | 0-60000 | 更快重新处理同一非 TOP 线程的同状态任务，但增加状态核验和系统调用；TOP 不受此抑制。0 表示不抑制。 |
+| `schedule_cleanup_interval_ms` | 5000ms | 100-600000 | 更快清理工作线程中的调度时间记录，但清理遍历更频繁；它不是扫描周期。 |
+| `cgroup_check_interval_ms` | 1000ms | 0-60000 | 更快发现外部 cgroup 漂移，但增加 `/proc/<pid>/task/<tid>/cgroup` 读取；0 表示每次候选任务都检查。 |
+| `cpuset_retry_count` | 3 | 1-20 | 降低可缩短失败路径，但瞬时失败恢复能力降低。此值是总尝试次数。 |
+| `cpuset_retry_interval_ms` | 10ms | 0-1000 | 降低可缩短 cpuset 写入重试延迟，但瞬时内核状态可能尚未恢复；0 表示连续重试。 |
+| `cpuset_group_check_ttl_ms` | 1000ms | 0-60000 | 更快重新确认 cpuset 组可用性，但增加控制文件读取；0 表示每次确认。 |
+| `process_cache_ttl_ms` | 100ms | 0-60000 | 更快重新匹配进程规则，但增加正则匹配；0 表示关闭该结果缓存。 |
+| `file_cache_ttl_ms` | 100ms | 0-60000 | 更快反映普通文件变化，但增加文件读取；动态 `/proc`、cpuset、cpuctl 路径原本就不会使用此缓存。0 表示关闭。 |
+| `cgroup_cache_ttl_ms` | 100ms | 0-60000 | 更快反映进程 cgroup 状态变化，但增加 cgroup 文件读取；0 表示关闭。 |
+| `monitor_initial_restart_delay_s` | 1s | 0-60 | 监控首次启动失败后更快重试；0 表示主循环下一轮即可尝试。 |
+| `monitor_restart_retry_delay_s` | 5s | 1-300 | 监控异常停止后更快恢复增量事件，但持续故障时日志与重试负载增加。 |
+| `config_retry_initial_delay_s` | 1s | 1-60 | 无效配置修复后更快重试解析，但持续写入坏配置时解析更频繁。 |
+| `config_retry_max_delay_s` | 5s | 1-300 | 限制无效配置指数退避的上限；若小于初始延迟，会自动提升到初始延迟。 |
+
+#### 延迟优先建议起点
+
+下面只是一组渐进式起点，不保证适合所有 ROM。建议一次只调一组参数，并同时观察 ReUperf CPU 占用、上下文切换和目标线程生效时间：
+
+```json
+"highspeed_sched_ms": 100,
+"refresh_interval_ms": 1000,
+"top_scan_budget_us": 6000,
+"full_scan_budget_us": 16000,
+"timing": {
+  "event_throttle_ms": 10,
+  "min_schedule_interval_ms": 50,
+  "cgroup_check_interval_ms": 250,
+  "cpuset_retry_count": 3,
+  "cpuset_retry_interval_ms": 2,
+  "cpuset_group_check_ttl_ms": 250,
+  "process_cache_ttl_ms": 25,
+  "file_cache_ttl_ms": 25,
+  "cgroup_cache_ttl_ms": 25
+}
+```
+
+优先降低 `event_throttle_ms` 和 `highspeed_sched_ms`，它们最直接影响新进程事件与新线程发现延迟。只有确认 cgroup 被其他组件频繁改写时，才建议明显降低 `cgroup_check_interval_ms`。缓存 TTL 降为 0 会显著增加读取或正则匹配，不建议作为通用配置。
 
 ### 日志级别说明
 

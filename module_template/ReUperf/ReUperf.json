@@ -6,12 +6,28 @@
   "modules": {
     "sched": {
       "enable": true,
-      "refresh_interval_ms": 2000,
-      "highspeed_sched_ms": 300,
-      "top_scan_budget_us": 4000,
-      "full_scan_budget_us": 12000,
-      "scan_batch_size": 32,
+      "refresh_interval_ms": 1200,
+      "highspeed_sched_ms": 150,
+      "top_scan_budget_us": 6000,
+      "full_scan_budget_us": 16000,
+      "scan_batch_size": 48,
       "scan_batch_yield_us": 0,
+      "timing": {
+        "event_throttle_ms": 25,
+        "min_schedule_interval_ms": 100,
+        "schedule_cleanup_interval_ms": 4000,
+        "cgroup_check_interval_ms": 500,
+        "cpuset_retry_count": 3,
+        "cpuset_retry_interval_ms": 5,
+        "cpuset_group_check_ttl_ms": 500,
+        "process_cache_ttl_ms": 50,
+        "file_cache_ttl_ms": 50,
+        "cgroup_cache_ttl_ms": 50,
+        "monitor_initial_restart_delay_s": 1,
+        "monitor_restart_retry_delay_s": 3,
+        "config_retry_initial_delay_s": 1,
+        "config_retry_max_delay_s": 4
+      },
       "log": {
         "level": "info",
         "output": "/data/adb/ReUperf/ReUperf.log"
@@ -226,7 +242,7 @@
               "pc": "rtusr",
               "uclamp_max": 100,
               "cpu_share": 1024,
-              "enable_limit": true
+              "enable_limit": false
             },
             {
               "k": "^(RenderThread|GLThread)",
@@ -254,8 +270,8 @@
               "k": ".",
               "ac": "bg",
               "pc": "bg",
-              "uclamp_max": 30,
-              "cpu_share": 308,
+              "uclamp_max": 75,
+              "cpu_share": 768,
               "enable_limit": true
             }
           ]
@@ -323,7 +339,7 @@
         },
         {
           "name": "SystemUI",
-          "regex": "com.android.systemui",
+          "regex": "com\\.android\\.systemui",
           "pinned": true,
           "rules": [
             {
@@ -340,7 +356,7 @@
         },
         {
           "name": "MediaProvider",
-          "regex": "^com.android.providers.media",
+          "regex": "^com\\.android\\.providers\\.media",
           "pinned": true,
           "rules": [
             {
@@ -364,7 +380,7 @@
         },
         {
           "name": "Phone",
-          "regex": "com.android.phone",
+          "regex": "com\\.android\\.phone",
           "topfore": true,
           "rules": [
             {
@@ -398,7 +414,7 @@
         },
         {
           "name": "讯飞输入法",
-          "regex": "^com.iflytek.inputmethod",
+          "regex": "^com\\.iflytek\\.inputmethod",
           "rules": [
             {
               "k": ".",
@@ -409,7 +425,7 @@
         },
         {
           "name": "搜狗输入法",
-          "regex": "^com.sohu.inputmethod.sogou",
+          "regex": "^com\\.sohu\\.inputmethod\\.sogou",
           "rules": [
             {
               "k": ".",
@@ -420,7 +436,7 @@
         },
         {
           "name": "百度输入法",
-          "regex": "^com.baidu.input",
+          "regex": "^com\\.baidu\\.input",
           "rules": [
             {
               "k": ".",
@@ -431,7 +447,7 @@
         },
         {
           "name": "QQ",
-          "regex": "^com.tencent.mobileqq",
+          "regex": "^com\\.tencent\\.mobileqq",
           "rules": [
             {
               "k": "(NTSDK|HeapTask|Msg_Storage|logWrite|pool-)",
@@ -447,7 +463,7 @@
         },
         {
           "name": "霹雳霹雳的崽",
-          "regex": "(tv.danmaku.bili:ijkservice|tv.danmaku.bili:web)",
+          "regex": "(tv\\.danmaku\\.bili:ijkservice|tv\\.danmaku\\.bili:web)",
           "rules": [
             {
               "k": ".",
@@ -458,7 +474,7 @@
         },
         {
           "name": "霹雳霹雳",
-          "regex": "^tv.danmaku.bili",
+          "regex": "^tv\\.danmaku\\.bili",
           "rules": [
             {
               "k": "(IJK_External|RenderThread)",
@@ -474,7 +490,7 @@
         },
         {
           "name": "和平精英",
-          "regex": "^com.tencent.tmgp.pubgmhd",
+          "regex": "^com\\.tencent\\.tmgp\\.pubgmhd",
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -500,7 +516,7 @@
         },
         {
           "name": "穿越火线",
-          "regex": "^com.tencent.tmgp.cf",
+          "regex": "^com\\.tencent\\.tmgp\\.cf",
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -536,7 +552,7 @@
         },
         {
           "name": "暗区突围",
-          "regex": "^com.tencent.tmgp.cf",
+          "regex": "^com\\.tencent\\.mf\\.uam",
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -572,7 +588,7 @@
         },
         {
           "name": "Terraria",
-          "regex": "^(com.and.games505.TerrariaPaid|com.xd.terraria)",
+          "regex": "^(com\\.and\\.games505\\.TerrariaPaid|com\\.xd\\.terraria)",
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -593,7 +609,7 @@
         },
         {
           "name": "黎明觉醒",
-          "regex": "^com.tencent.toaa",
+          "regex": "^com\\.tencent\\.toaa",
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -619,7 +635,7 @@
         },
         {
           "name": "Genshin Impact",
-          "regex": "^(com.miHoYo.Yuanshen|com.miHoYo.GenshinImpact)",
+          "regex": "^(com\\.miHoYo\\.Yuanshen|com\\.miHoYo\\.GenshinImpact)",
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -675,7 +691,7 @@
         },
         {
           "name": "Honkai Impact",
-          "regex": "^com.miHoYo.enterprise.NGHSoD",
+          "regex": "^com\\.miHoYo\\.enterprise\\.NGHSoD",
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -711,7 +727,7 @@
         },
         {
           "name": "hkrpg",
-          "regex": "^com.miHoYo.hkrpg",
+          "regex": "^com\\.miHoYo\\.hkrpg",
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -752,7 +768,7 @@
         },
         {
           "name": "SkyChildrenOfTheLight",
-          "regex": "^com.netease.sky",
+          "regex": "^com\\.netease\\.sky",
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -778,7 +794,7 @@
         },
         {
           "name": "MC",
-          "regex": "^(com.mojang.minecraftpe|com.netease.x19)",
+          "regex": "^(com\\.mojang\\.minecraftpe|com\\.netease\\.x19)",
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -804,7 +820,7 @@
         },
         {
           "name": "Arknights",
-          "regex": "^com.hypergryph.arknights",
+          "regex": "^com\\.hypergryph\\.arknights",
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -830,7 +846,7 @@
         },
         {
           "name": "Honor of Tencent",
-          "regex": "^com.tencent.tmgp.sgame",
+          "regex": "^com\\.tencent\\.tmgp\\.sgame",
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -861,7 +877,7 @@
         },
         {
           "name": "QQ飞车",
-          "regex": "^com.tencent.tmgp.speedmobile",
+          "regex": "^com\\.tencent\\.tmgp\\.speedmobile",
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -897,7 +913,7 @@
         },
         {
           "name": "最好玩的游戏系列",
-          "regex": "^com.primatelabs.geekbench5|com.ioncannon.cpuburn.gpugflops|com.futuremark.dmandroid.application|com.andromeda.androbench",
+          "regex": "^com\\.primatelabs\\.geekbench5|com\\.ioncannon\\.cpuburn\\.gpugflops|com\\.futuremark\\.dmandroid\\.application|com\\.andromeda\\.androbench",
           "rules": [
             {
               "k": "^AsyncTask",

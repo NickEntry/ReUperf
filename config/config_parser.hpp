@@ -193,6 +193,7 @@ private:
         cfg.full_scan_budget_us = parse_bounded_int("full_scan_budget_us", 12000, 1000, 50000);
         cfg.scan_batch_size = parse_bounded_int("scan_batch_size", 32, 1, 256);
         cfg.scan_batch_yield_us = parse_bounded_int("scan_batch_yield_us", 0, 0, 1000);
+        parse_timing(sched, cfg.timing);
 
         if (sched.contains("log")) {
             const json& log = sched["log"];
@@ -213,6 +214,48 @@ private:
         parse_prio(sched, cfg);
         parse_rules(sched, cfg);
         validate_references(cfg);
+    }
+
+    static void parse_timing(const json& sched, TimingConfig& timing) {
+        const auto timing_it = sched.find("timing");
+        if (timing_it == sched.end()) {
+            return;
+        }
+        if (!timing_it->is_object()) {
+            LOG_W("ConfigParser", "timing must be an object");
+            return;
+        }
+        const json& values = *timing_it;
+        const auto parse = [&values](const char* name, int current, int min_value, int max_value) {
+            int value = current;
+            if (values.contains(name) && values[name].is_number_integer()) {
+                value = values[name].get<int>();
+            }
+            if (value < min_value || value > max_value) {
+                LOG_W("ConfigParser", "Invalid timing." + std::string(name) + " "
+                      + std::to_string(value) + ", using default " + std::to_string(current));
+                return current;
+            }
+            return value;
+        };
+        timing.event_throttle_ms = parse("event_throttle_ms", 50, 0, 5000);
+        timing.min_schedule_interval_ms = parse("min_schedule_interval_ms", 200, 0, 60000);
+        timing.schedule_cleanup_interval_ms = parse("schedule_cleanup_interval_ms", 5000, 100, 600000);
+        timing.cgroup_check_interval_ms = parse("cgroup_check_interval_ms", 1000, 0, 60000);
+        timing.cpuset_retry_count = parse("cpuset_retry_count", 3, 1, 20);
+        timing.cpuset_retry_interval_ms = parse("cpuset_retry_interval_ms", 10, 0, 1000);
+        timing.cpuset_group_check_ttl_ms = parse("cpuset_group_check_ttl_ms", 1000, 0, 60000);
+        timing.process_cache_ttl_ms = parse("process_cache_ttl_ms", 100, 0, 60000);
+        timing.file_cache_ttl_ms = parse("file_cache_ttl_ms", 100, 0, 60000);
+        timing.cgroup_cache_ttl_ms = parse("cgroup_cache_ttl_ms", 100, 0, 60000);
+        timing.monitor_initial_restart_delay_s = parse("monitor_initial_restart_delay_s", 1, 0, 60);
+        timing.monitor_restart_retry_delay_s = parse("monitor_restart_retry_delay_s", 5, 1, 300);
+        timing.config_retry_initial_delay_s = parse("config_retry_initial_delay_s", 1, 1, 60);
+        timing.config_retry_max_delay_s = parse("config_retry_max_delay_s", 5, 1, 300);
+        if (timing.config_retry_max_delay_s < timing.config_retry_initial_delay_s) {
+            LOG_W("ConfigParser", "timing.config_retry_max_delay_s is below initial delay; using initial delay");
+            timing.config_retry_max_delay_s = timing.config_retry_initial_delay_s;
+        }
     }
 
     static void parse_cpumask(const json& sched, SchedConfig& cfg) {

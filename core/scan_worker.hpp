@@ -64,9 +64,9 @@ class ScanWorker {
     };
 
 public:
-    explicit ScanWorker(const std::string& name) 
-        : name_(name), running_(false), started_(false),
-          matcher_(nullptr), cpuset_(nullptr), prio_(nullptr), 
+    explicit ScanWorker(const std::string& name, const TimingConfig& timing = {})
+        : name_(name), running_(false), started_(false), timing_(timing),
+          matcher_(nullptr), cpuset_(nullptr), prio_(nullptr),
           cpuctl_(nullptr), cache_(nullptr) {}
     
     ~ScanWorker() {
@@ -173,6 +173,7 @@ private:
     std::string name_;
     std::atomic<bool> running_;
     std::atomic<bool> started_;
+    TimingConfig timing_;
     static constexpr size_t kMaxQueuedTasks = 4096;
     std::thread thread_;
     std::queue<TaskKey> task_queue_;
@@ -190,10 +191,7 @@ private:
         return {task.pid, task.tid, task.process_start_time, task.thread_start_time};
     }
     
-    static constexpr int64_t kMinScheduleIntervalMs = 200;
-    static constexpr int64_t kScheduleCleanupIntervalMs = 5000;
     static constexpr size_t kScheduleCleanupThreshold = 500;
-    static constexpr int64_t kCgroupCheckIntervalMs = 1000;
     std::unordered_map<TaskKey, std::chrono::steady_clock::time_point, TaskKeyHash>
         last_schedule_time_;
     std::unordered_map<TaskKey, ProcessState, TaskKeyHash> last_schedule_state_;
@@ -207,7 +205,7 @@ private:
         for (auto it = last_schedule_time_.begin(); it != last_schedule_time_.end(); ) {
             const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - it->second).count();
-            if (elapsed > kScheduleCleanupIntervalMs) {
+            if (elapsed > timing_.schedule_cleanup_interval_ms) {
                 last_schedule_state_.erase(it->first);
                 it = last_schedule_time_.erase(it);
             } else {
@@ -215,7 +213,7 @@ private:
             }
         }
         for (auto it = next_cgroup_check_time_.begin(); it != next_cgroup_check_time_.end(); ) {
-            if (now - it->second > std::chrono::milliseconds(kScheduleCleanupIntervalMs)) {
+            if (now - it->second > std::chrono::milliseconds(timing_.schedule_cleanup_interval_ms)) {
                 it = next_cgroup_check_time_.erase(it);
             } else {
                 ++it;
@@ -235,7 +233,7 @@ private:
             && time_it != last_schedule_time_.end()) {
             const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - time_it->second).count();
-            if (elapsed < kMinScheduleIntervalMs) {
+            if (elapsed < timing_.min_schedule_interval_ms) {
                 return true;
             }
         }
@@ -253,16 +251,19 @@ private:
         const auto now = std::chrono::steady_clock::now();
         const TaskKey key = task_key(task);
         auto it = next_cgroup_check_time_.find(key);
+        if (timing_.cgroup_check_interval_ms == 0) {
+            return true;
+        }
         if (it == next_cgroup_check_time_.end()) {
             const auto stagger_ms = static_cast<int64_t>(
-                TaskKeyHash{}(key) % static_cast<size_t>(kCgroupCheckIntervalMs));
+                TaskKeyHash{}(key) % static_cast<size_t>(timing_.cgroup_check_interval_ms));
             next_cgroup_check_time_[key] = now + std::chrono::milliseconds(stagger_ms);
             return stagger_ms == 0;
         }
         if (now < it->second) {
             return false;
         }
-        it->second = now + std::chrono::milliseconds(kCgroupCheckIntervalMs);
+        it->second = now + std::chrono::milliseconds(timing_.cgroup_check_interval_ms);
         if (++cgroup_check_counter_ >= kScheduleCleanupThreshold) {
             cgroup_check_counter_ = 0;
             cleanup_expired_schedule_times(now);

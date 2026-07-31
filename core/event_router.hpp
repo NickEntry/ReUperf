@@ -26,6 +26,12 @@ public:
     explicit EventRouter(int throttle_ms = 50)
         : throttle_ms_(throttle_ms), running_(false) {}
 
+    void set_throttle_ms(int throttle_ms) {
+        // An in-flight batch keeps its original deadline; the new value applies
+        // to the next batch so aggregation semantics remain deterministic.
+        throttle_ms_.store(throttle_ms, std::memory_order_relaxed);
+    }
+
     ~EventRouter() {
         stop();
     }
@@ -53,7 +59,8 @@ public:
             on_handler_failure_ = nullptr;
             throw;
         }
-        LOG_I("EventRouter", "Started with throttle=" + std::to_string(throttle_ms_) + "ms");
+        LOG_I("EventRouter", "Started with throttle="
+              + std::to_string(throttle_ms_.load(std::memory_order_relaxed)) + "ms");
     }
 
     void stop() {
@@ -90,7 +97,7 @@ private:
 
     static constexpr size_t kMaxPendingEvents = 4096;
 
-    int throttle_ms_;
+    std::atomic<int> throttle_ms_;
     std::atomic<bool> running_;
     std::thread thread_;
     mutable std::mutex mutex_;
@@ -158,7 +165,7 @@ private:
                     break;
                 }
                 const auto flush_at = std::chrono::steady_clock::now()
-                    + std::chrono::milliseconds(throttle_ms_);
+                    + std::chrono::milliseconds(throttle_ms_.load(std::memory_order_relaxed));
                 cv_.wait_until(lock, flush_at, [this]() { return !running_.load(); });
                 events.swap(pending_events_);
                 events_dropped = events_dropped_;

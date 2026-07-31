@@ -2,6 +2,7 @@
 #define FILE_UTILS_HPP
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <fstream>
@@ -23,6 +24,21 @@
 enum class ProcessState;
 
 namespace FileUtils {
+
+inline std::atomic<int>& file_cache_ttl_ms() {
+    static std::atomic<int> value{100};
+    return value;
+}
+
+inline std::atomic<int>& cgroup_cache_ttl_ms() {
+    static std::atomic<int> value{100};
+    return value;
+}
+
+inline void set_cache_ttls(int file_ttl_ms, int cgroup_ttl_ms) {
+    file_cache_ttl_ms().store(file_ttl_ms, std::memory_order_relaxed);
+    cgroup_cache_ttl_ms().store(cgroup_ttl_ms, std::memory_order_relaxed);
+}
 
 inline bool file_exists(const std::string& path) {
     struct stat st;
@@ -119,7 +135,6 @@ namespace {
     inline std::mutex file_cache_mutex;
     inline std::unordered_map<std::string, std::list<std::string>::iterator> file_cache_order;
     inline std::list<std::string> file_cache_lru;
-    static constexpr int kFileCacheTTLMs = 100;
     static constexpr size_t kMaxCacheSize = 1000;
 
     inline void touch_file_cache_entry(const std::string& path) {
@@ -153,7 +168,8 @@ inline std::string read_file(const std::string& path) {
         std::lock_guard<std::mutex> lock(file_cache_mutex);
         auto it = file_cache.find(path);
         if (it != file_cache.end() && std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - it->second.timestamp).count() < kFileCacheTTLMs) {
+                now - it->second.timestamp).count()
+                    < file_cache_ttl_ms().load(std::memory_order_relaxed)) {
             touch_file_cache_entry(path);
             return it->second.content;
         }
@@ -384,7 +400,6 @@ inline std::mutex& get_cgroup_cache_mutex() {
 inline std::string get_cgroup_path_from_file(const std::string& cgroup_file,
                                               uint64_t cache_pid,
                                               const std::string& controller) {
-    static constexpr int64_t kCacheTTLMs = 100;
     static constexpr size_t kMaxCgroupCacheSize = 1000;
 
     const auto now = std::chrono::steady_clock::now();
@@ -395,7 +410,7 @@ inline std::string get_cgroup_path_from_file(const std::string& cgroup_file,
         const auto it = cache.find(key);
         if (it != cache.end()
             && std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.timestamp).count()
-                < kCacheTTLMs) {
+                < cgroup_cache_ttl_ms().load(std::memory_order_relaxed)) {
             return it->second.path;
         }
     }
@@ -435,7 +450,7 @@ inline std::string get_cgroup_path_from_file(const std::string& cgroup_file,
             for (auto it = cache.begin(); it != cache.end();) {
                 const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - it->second.timestamp).count();
-                if (elapsed >= kCacheTTLMs) {
+                if (elapsed >= cgroup_cache_ttl_ms().load(std::memory_order_relaxed)) {
                     it = cache.erase(it);
                 } else {
                     ++it;

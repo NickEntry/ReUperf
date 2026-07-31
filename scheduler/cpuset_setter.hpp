@@ -16,8 +16,8 @@
 
 class CpusetSetter {
 public:
-    CpusetSetter(ThreadMatcher& matcher)
-        : matcher_(matcher) {}
+    CpusetSetter(ThreadMatcher& matcher, const TimingConfig& timing = {})
+        : matcher_(matcher), timing_(timing) {}
 
     std::vector<int> get_cpus_for_affinity(const std::string& affinity_class, ProcessState state) const {
         return matcher_.get_cpus_for_affinity(affinity_class, state);
@@ -59,23 +59,21 @@ public:
         if (!is_group_ready(path)) return false;
 
         // Keep this lightweight; do not over-defend against trusted local configuration.
-        // 增加重试机制
-        constexpr int kMaxRetries = 3;
-        constexpr int kRetryIntervalMs = 10;
-        
-        for (int retry = 0; retry < kMaxRetries; ++retry) {
+        for (int retry = 0; retry < timing_.cpuset_retry_count; ++retry) {
             if (FileUtils::write_kernel_control_file(path + "/tasks", std::to_string(tid))) {
                 LOG_T("CpusetSetter", "Moved tid " + std::to_string(tid) + " to cpuset " + path);
                 return true;
             }
             
-            if (retry < kMaxRetries - 1) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(kRetryIntervalMs));
+            if (retry < timing_.cpuset_retry_count - 1 && timing_.cpuset_retry_interval_ms > 0) {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(timing_.cpuset_retry_interval_ms));
             }
         }
         
         invalidate_group(path);
-        LOG_W("CpusetSetter", "Failed to move tid " + std::to_string(tid) + " to " + path + " after " + std::to_string(kMaxRetries) + " retries");
+        LOG_W("CpusetSetter", "Failed to move tid " + std::to_string(tid) + " to " + path
+              + " after " + std::to_string(timing_.cpuset_retry_count) + " attempts");
         return false;
     }
     
@@ -133,12 +131,12 @@ public:
 
 private:
     ThreadMatcher& matcher_;
+    TimingConfig timing_;
     struct GroupCheck {
         bool ready = false;
         std::chrono::steady_clock::time_point checked_at;
     };
 
-    static constexpr auto kGroupCheckTTL = std::chrono::seconds(1);
     mutable std::mutex mutex_;
     std::unordered_map<std::string, GroupCheck> group_checks_;
 
@@ -147,7 +145,9 @@ private:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             const auto it = group_checks_.find(path);
-            if (it != group_checks_.end() && now - it->second.checked_at < kGroupCheckTTL) {
+            if (it != group_checks_.end()
+                && now - it->second.checked_at
+                    < std::chrono::milliseconds(timing_.cpuset_group_check_ttl_ms)) {
                 return it->second.ready;
             }
         }

@@ -415,7 +415,6 @@ private:
         std::chrono::steady_clock::time_point timestamp;
     };
 
-    static constexpr int64_t kProcessCacheTTLMs = 100;
     static constexpr size_t kMaxProcessCacheEntriesPerBucket = 256;
 
     // 细粒度锁：分桶策略
@@ -434,7 +433,7 @@ private:
         if (it != process_cache_[bucket].end()) {
             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - it->second.timestamp).count();
-            if (elapsed_ms < kProcessCacheTTLMs) {
+            if (elapsed_ms < config_.sched.timing.process_cache_ttl_ms) {
                 return it->second;
             }
             process_cache_[bucket].erase(it);
@@ -451,7 +450,7 @@ private:
         for (auto it = cache.begin(); it != cache.end();) {
             const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - it->second.timestamp).count();
-            if (elapsed_ms >= kProcessCacheTTLMs) {
+            if (elapsed_ms >= config_.sched.timing.process_cache_ttl_ms) {
                 it = cache.erase(it);
             } else {
                 ++it;

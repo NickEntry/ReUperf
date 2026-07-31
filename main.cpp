@@ -786,8 +786,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
+    FileUtils::set_cache_ttls(config.sched.timing.file_cache_ttl_ms,
+                              config.sched.timing.cgroup_cache_ttl_ms);
     auto matcher_ptr = std::make_shared<ThreadMatcher>(config);
-    auto cpuset_ptr = std::make_shared<CpusetSetter>(*matcher_ptr);
+    auto cpuset_ptr = std::make_shared<CpusetSetter>(*matcher_ptr, config.sched.timing);
     auto prio_ptr = std::make_shared<PrioritySetter>(*matcher_ptr);
     auto cpuctl_ptr = std::make_shared<CpuctlSetter>();
     auto cache_ptr = std::make_shared<ThreadCache>();
@@ -805,10 +807,10 @@ int main(int argc, char* argv[]) {
     std::mutex scheduler_state_mutex;
 
     std::vector<std::unique_ptr<ScanWorker>> workers;
-    workers.push_back(std::make_unique<ScanWorker>("ScanWorker1"));
-    workers.push_back(std::make_unique<ScanWorker>("ScanWorker2"));
-    workers.push_back(std::make_unique<ScanWorker>("ScanWorker3"));
-    workers.push_back(std::make_unique<ScanWorker>("ScanWorker4"));
+    workers.push_back(std::make_unique<ScanWorker>("ScanWorker1", config.sched.timing));
+    workers.push_back(std::make_unique<ScanWorker>("ScanWorker2", config.sched.timing));
+    workers.push_back(std::make_unique<ScanWorker>("ScanWorker3", config.sched.timing));
+    workers.push_back(std::make_unique<ScanWorker>("ScanWorker4", config.sched.timing));
     
     for (auto& w : workers) {
         w->set_configs(matcher_ptr, cpuset_ptr, prio_ptr, cpuctl_ptr, cache_ptr);
@@ -819,7 +821,7 @@ int main(int argc, char* argv[]) {
     full_rescan_needed.store(true, std::memory_order_release);
 
     
-    g_event_router = std::make_shared<EventRouter>(50);
+    g_event_router = std::make_shared<EventRouter>(config.sched.timing.event_throttle_ms);
     
     g_event_router->start([&](const std::set<int>& new_pids, const std::set<int>& dead_pids,
                               const std::set<int>& recycled_pids, bool events_dropped) {
@@ -899,7 +901,8 @@ int main(int argc, char* argv[]) {
     }
     // Cover the unavoidable gap before the /proc watch becomes active.
     full_rescan_needed.store(true, std::memory_order_release);
-    auto next_monitor_restart = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    auto next_monitor_restart = std::chrono::steady_clock::now()
+        + std::chrono::seconds(config.sched.timing.monitor_initial_restart_delay_s);
 
     
     ConfigFileWatcher config_watcher(config_path);
@@ -908,7 +911,7 @@ int main(int argc, char* argv[]) {
     time_t last_mtime = get_file_mtime(config_path);
     uint64_t last_config_hash = compute_config_hash(config_path);
     uint64_t failed_config_hash = 0;
-    int config_retry_delay_seconds = 1;
+    int config_retry_delay_seconds = config.sched.timing.config_retry_initial_delay_s;
     auto next_config_retry = std::chrono::steady_clock::time_point::min();
     LOG_I("Main", "Initial config hash: " + std::to_string(last_config_hash));
     
@@ -945,7 +948,8 @@ int main(int argc, char* argv[]) {
                 LOG_W("Main", "Incremental /proc monitor restart failed; continuing with periodic full scans");
             }
             full_rescan_needed.store(true, std::memory_order_release);
-            next_monitor_restart = monitor_now + std::chrono::seconds(5);
+            next_monitor_restart = monitor_now
+                + std::chrono::seconds(config.sched.timing.monitor_restart_retry_delay_s);
         }
 
         const bool config_changed_inotify = config_watcher.check_and_clear();
@@ -978,13 +982,14 @@ int main(int argc, char* argv[]) {
                         } else {
                             // Build every replacement object before stopping the active scheduler.
                             auto new_matcher = std::make_shared<ThreadMatcher>(new_config);
-                            auto new_cpuset = std::make_shared<CpusetSetter>(*new_matcher);
+                            auto new_cpuset = std::make_shared<CpusetSetter>(
+                                *new_matcher, new_config.sched.timing);
                             auto new_prio = std::make_shared<PrioritySetter>(*new_matcher);
                             auto new_cpuctl = std::make_shared<CpuctlSetter>();
                             std::vector<std::unique_ptr<ScanWorker>> new_workers;
                             for (int index = 1; index <= 4; ++index) {
                                 auto worker = std::make_unique<ScanWorker>(
-                                    "ScanWorker" + std::to_string(index));
+                                    "ScanWorker" + std::to_string(index), new_config.sched.timing);
                                 worker->set_configs(new_matcher, new_cpuset, new_prio, new_cpuctl, cache_ptr);
                                 new_workers.push_back(std::move(worker));
                             }
@@ -1054,6 +1059,12 @@ int main(int argc, char* argv[]) {
                                 highspeed_ms = std::max(config.sched.highspeed_sched_ms, 1);
                                 refresh_ms = std::max(config.sched.refresh_interval_ms, highspeed_ms);
                                 next_full_scan = std::chrono::steady_clock::now();
+                                FileUtils::set_cache_ttls(config.sched.timing.file_cache_ttl_ms,
+                                                          config.sched.timing.cgroup_cache_ttl_ms);
+                                g_event_router->set_throttle_ms(
+                                    config.sched.timing.event_throttle_ms);
+                                config_retry_delay_seconds =
+                                    config.sched.timing.config_retry_initial_delay_s;
 
                                 std::string new_log_path = config.sched.log.output;
                                 if (new_log_path.empty() || new_log_path == "stdout" || new_log_path == "stderr") {
@@ -1078,15 +1089,17 @@ int main(int argc, char* argv[]) {
                 last_mtime = current_mtime;
                 last_config_hash = current_hash;
                 failed_config_hash = 0;
-                config_retry_delay_seconds = 1;
+                config_retry_delay_seconds = config.sched.timing.config_retry_initial_delay_s;
                 next_config_retry = std::chrono::steady_clock::time_point::min();
                 full_rescan_needed.store(true, std::memory_order_release);
             } else if (current_hash != 0) {
                 if (failed_config_hash == current_hash) {
-                    config_retry_delay_seconds = std::min(config_retry_delay_seconds * 2, 5);
+                    config_retry_delay_seconds = std::min(
+                        config_retry_delay_seconds * 2,
+                        config.sched.timing.config_retry_max_delay_s);
                 } else {
                     failed_config_hash = current_hash;
-                    config_retry_delay_seconds = 1;
+                    config_retry_delay_seconds = config.sched.timing.config_retry_initial_delay_s;
                 }
                 next_config_retry = config_check_now
                     + std::chrono::seconds(config_retry_delay_seconds);

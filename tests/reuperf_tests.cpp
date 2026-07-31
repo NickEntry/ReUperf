@@ -83,6 +83,52 @@ void test_config_validation() {
     std::filesystem::remove(duplicate);
 }
 
+void test_timing_config() {
+    const auto path = std::filesystem::temp_directory_path() / "reuperf-timing.json";
+    {
+        std::ofstream output(path);
+        output << R"({"modules":{"sched":{"timing":{)"
+               << R"("event_throttle_ms":0,)"
+               << R"("min_schedule_interval_ms":25,)"
+               << R"("cgroup_check_interval_ms":0,)"
+               << R"("cpuset_retry_count":5,)"
+               << R"("cpuset_retry_interval_ms":2,)"
+               << R"("process_cache_ttl_ms":20,)"
+               << R"("file_cache_ttl_ms":30,)"
+               << R"("cgroup_cache_ttl_ms":40,)"
+               << R"("config_retry_initial_delay_s":8,)"
+               << R"("config_retry_max_delay_s":3)"
+               << R"(}}}})";
+    }
+    const auto result = ConfigParser::parse(path.string());
+    require(result.success, "timing config failed to parse");
+    const auto& timing = result.config.sched.timing;
+    require(timing.event_throttle_ms == 0, "zero event throttle was rejected");
+    require(timing.min_schedule_interval_ms == 25, "schedule interval was not parsed");
+    require(timing.cgroup_check_interval_ms == 0, "zero cgroup interval was rejected");
+    require(timing.cpuset_retry_count == 5 && timing.cpuset_retry_interval_ms == 2,
+            "cpuset retry timing was not parsed");
+    require(timing.process_cache_ttl_ms == 20 && timing.file_cache_ttl_ms == 30
+                && timing.cgroup_cache_ttl_ms == 40,
+            "cache TTL timing was not parsed");
+    require(timing.config_retry_initial_delay_s == 8
+                && timing.config_retry_max_delay_s == 8,
+            "config retry maximum was not clamped to the initial delay");
+    std::filesystem::remove(path);
+
+    const auto invalid_path = std::filesystem::temp_directory_path() / "reuperf-timing-invalid.json";
+    {
+        std::ofstream output(invalid_path);
+        output << R"({"modules":{"sched":{"timing":{"cpuset_retry_count":0,"file_cache_ttl_ms":60001}}}})";
+    }
+    const auto invalid = ConfigParser::parse(invalid_path.string());
+    require(invalid.config.sched.timing.cpuset_retry_count == 3,
+            "invalid retry count did not fall back to default");
+    require(invalid.config.sched.timing.file_cache_ttl_ms == 100,
+            "invalid file cache TTL did not fall back to default");
+    std::filesystem::remove(invalid_path);
+}
+
 void test_cpu_mask_formatting() {
     require(CpuMask::to_string(std::vector<int>{0, 1, 2, 4, 6, 7}) == "0-2,4,6-7",
             "CPU mask range formatting failed");
@@ -238,6 +284,7 @@ int main() {
     Logger::instance().init(LogLevel::ERR, "", false);
     test_cgroup_and_stat_parsing();
     test_config_validation();
+    test_timing_config();
     test_cpu_mask_formatting();
     test_home_package_regex_is_literal();
     test_thread_cache_identity();
