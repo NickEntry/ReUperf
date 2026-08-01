@@ -29,6 +29,16 @@ struct MatchResult {
     bool topfore = false;
 };
 
+inline bool has_resolved_affinity(const MatchResult& result) {
+    return !result.affinity_class.empty() && result.affinity_class != "auto"
+        && !result.cpumask_name.empty();
+}
+
+inline bool should_restore_managed_affinity(const std::optional<MatchResult>& previous,
+                                            const MatchResult& current) {
+    return previous && has_resolved_affinity(*previous) && !has_resolved_affinity(current);
+}
+
 inline bool is_result_equal(const MatchResult& a, const MatchResult& b) {
     return a.matched == b.matched &&
            a.affinity_class == b.affinity_class &&

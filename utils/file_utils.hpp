@@ -538,15 +538,21 @@ inline CgroupState cgroup_path_to_state(const std::string& path) {
     return CgroupState::OTHER;
 }
 
-inline CgroupState get_cgroup_state(int pid) {
-    // ReUperf migrates threads in the cpuset hierarchy. Android's cpu controller
-    // remains the authoritative process-state source and is not affected by that move.
-    const std::string cpu_path = get_cgroup_path(pid, "cpu");
-    if (!cpu_path.empty()) {
-        return cgroup_path_to_state(cpu_path);
+inline CgroupState cgroup_paths_to_state(const std::string& cpu_path,
+                                         const std::string& cpuset_path) {
+    // Prefer a recognized cpu-controller state because ReUperf does not migrate that
+    // hierarchy. Some Android devices expose a non-empty but state-neutral cpu path
+    // such as "/"; in that case the cpuset controller remains the useful fallback.
+    const CgroupState cpu_state = cgroup_path_to_state(cpu_path);
+    if (cpu_state != CgroupState::OTHER) {
+        return cpu_state;
     }
-    // Compatibility fallback for devices that do not expose a named cpu controller.
-    return cgroup_path_to_state(get_cgroup_path(pid, "cpuset"));
+    return cgroup_path_to_state(cpuset_path);
+}
+
+inline CgroupState get_cgroup_state(int pid) {
+    return cgroup_paths_to_state(get_cgroup_path(pid, "cpu"),
+                                 get_cgroup_path(pid, "cpuset"));
 }
 
 // Write a single thread (TID) to a cgroup's tasks file.

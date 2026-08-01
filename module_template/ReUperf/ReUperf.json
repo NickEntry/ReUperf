@@ -415,6 +415,7 @@
         {
           "name": "讯飞输入法",
           "regex": "^com\\.iflytek\\.inputmethod",
+          "topfore": true,
           "rules": [
             {
               "k": ".",
@@ -426,6 +427,7 @@
         {
           "name": "搜狗输入法",
           "regex": "^com\\.sohu\\.inputmethod\\.sogou",
+          "topfore": true,
           "rules": [
             {
               "k": ".",
@@ -437,6 +439,7 @@
         {
           "name": "百度输入法",
           "regex": "^com\\.baidu\\.input",
+          "topfore": true,
           "rules": [
             {
               "k": ".",
@@ -448,6 +451,7 @@
         {
           "name": "QQ",
           "regex": "^com\\.tencent\\.mobileqq",
+          "topfore": true,
           "rules": [
             {
               "k": "(NTSDK|HeapTask|Msg_Storage|logWrite|pool-)",
@@ -464,6 +468,7 @@
         {
           "name": "霹雳霹雳的崽",
           "regex": "(tv\\.danmaku\\.bili:ijkservice|tv\\.danmaku\\.bili:web)",
+          "topfore": true,
           "rules": [
             {
               "k": ".",
@@ -475,6 +480,7 @@
         {
           "name": "霹雳霹雳",
           "regex": "^tv\\.danmaku\\.bili",
+          "topfore": true,
           "rules": [
             {
               "k": "(IJK_External|RenderThread)",
@@ -491,6 +497,7 @@
         {
           "name": "和平精英",
           "regex": "^com\\.tencent\\.tmgp\\.pubgmhd",
+          "topfore": true,
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -517,6 +524,7 @@
         {
           "name": "穿越火线",
           "regex": "^com\\.tencent\\.tmgp\\.cf",
+          "topfore": true,
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -553,6 +561,7 @@
         {
           "name": "暗区突围",
           "regex": "^com\\.tencent\\.mf\\.uam",
+          "topfore": true,
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -589,6 +598,7 @@
         {
           "name": "Terraria",
           "regex": "^(com\\.and\\.games505\\.TerrariaPaid|com\\.xd\\.terraria)",
+          "topfore": true,
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -610,6 +620,7 @@
         {
           "name": "黎明觉醒",
           "regex": "^com\\.tencent\\.toaa",
+          "topfore": true,
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -636,6 +647,7 @@
         {
           "name": "Genshin Impact",
           "regex": "^(com\\.miHoYo\\.Yuanshen|com\\.miHoYo\\.GenshinImpact)",
+          "topfore": true,
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -692,6 +704,7 @@
         {
           "name": "Honkai Impact",
           "regex": "^com\\.miHoYo\\.enterprise\\.NGHSoD",
+          "topfore": true,
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -728,6 +741,7 @@
         {
           "name": "hkrpg",
           "regex": "^com\\.miHoYo\\.hkrpg",
+          "topfore": true,
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -769,6 +783,7 @@
         {
           "name": "SkyChildrenOfTheLight",
           "regex": "^com\\.netease\\.sky",
+          "topfore": true,
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -795,6 +810,7 @@
         {
           "name": "MC",
           "regex": "^(com\\.mojang\\.minecraftpe|com\\.netease\\.x19)",
+          "topfore": true,
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -821,6 +837,7 @@
         {
           "name": "Arknights",
           "regex": "^com\\.hypergryph\\.arknights",
+          "topfore": true,
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -847,6 +864,7 @@
         {
           "name": "Honor of Tencent",
           "regex": "^com\\.tencent\\.tmgp\\.sgame",
+          "topfore": true,
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -878,6 +896,7 @@
         {
           "name": "QQ飞车",
           "regex": "^com\\.tencent\\.tmgp\\.speedmobile",
+          "topfore": true,
           "rules": [
             {
               "k": "/MAIN_THREAD/",
@@ -914,6 +933,7 @@
         {
           "name": "最好玩的游戏系列",
           "regex": "^com\\.primatelabs\\.geekbench5|com\\.ioncannon\\.cpuburn\\.gpugflops|com\\.futuremark\\.dmandroid\\.application|com\\.andromeda\\.androbench",
+          "topfore": true,
           "rules": [
             {
               "k": "^AsyncTask",
@@ -935,6 +955,7 @@
         {
           "name": "Default rule",
           "regex": ".",
+          "topfore": true,
           "rules": [
             {
               "k": "/MAIN_THREAD/",

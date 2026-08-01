@@ -52,6 +52,12 @@ void test_cgroup_and_stat_parsing() {
             "cpu background must map to BG");
     require(FileUtils::cgroup_path_to_state("/ReUperf_0-6") == CgroupState::OTHER,
             "custom cpuset must not masquerade as Android state");
+    require(FileUtils::cgroup_paths_to_state("/", "/foreground") == CgroupState::FG,
+            "state-neutral cpu path must fall back to foreground cpuset");
+    require(FileUtils::cgroup_paths_to_state("/uid_1000", "/top-app") == CgroupState::TOP,
+            "unrecognized cpu path must fall back to top-app cpuset");
+    require(FileUtils::cgroup_paths_to_state("/background", "/foreground") == CgroupState::BG,
+            "recognized cpu state must remain authoritative");
 
     const std::string stat =
         "123 (name with ) parenthesis) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242 20";
@@ -225,6 +231,32 @@ void test_event_router_throttle() {
     router.stop();
 }
 
+void test_resolved_affinity_detection() {
+    MatchResult result;
+    result.matched = true;
+    result.affinity_class = "u7";
+    result.cpumask_name = "c2";
+    require(has_resolved_affinity(result), "resolved affinity was not detected");
+
+    const MatchResult previous = result;
+    result.cpumask_name.clear();
+    require(!has_resolved_affinity(result),
+            "affinity with an empty state mask was treated as active");
+    require(should_restore_managed_affinity(previous, result),
+            "managed affinity removal did not request baseline restoration");
+    require(!should_restore_managed_affinity(std::nullopt, result),
+            "missing previous result requested affinity restoration");
+
+    MatchResult still_managed = previous;
+    still_managed.cpumask_name = "c1";
+    require(!should_restore_managed_affinity(previous, still_managed),
+            "transition between managed masks requested baseline restoration");
+
+    result.affinity_class = "auto";
+    result.cpumask_name = "c2";
+    require(!has_resolved_affinity(result), "auto affinity was treated as active");
+}
+
 void test_match_result_equality() {
     MatchResult left;
     left.matched = true;
@@ -288,6 +320,7 @@ int main() {
     test_cpu_mask_formatting();
     test_home_package_regex_is_literal();
     test_thread_cache_identity();
+    test_resolved_affinity_detection();
     test_match_result_equality();
     test_priority_policy_mapping();
     test_event_router_throttle();

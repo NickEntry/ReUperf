@@ -331,13 +331,17 @@ private:
         }
     }
     
+    bool needs_affinity_management(const MatchResult& result) const {
+        return has_resolved_affinity(result);
+    }
+
+    bool needs_priority_management(const MatchResult& result, ThreadMatcher& matcher) const {
+        return matcher.get_prio_value(result.prio_class, result.effective_state) != 0;
+    }
+
     bool needs_managed_state(const MatchResult& result, ThreadMatcher& matcher) const {
-        if (!result.matched) {
-            return false;
-        }
-        const bool has_affinity = !result.affinity_class.empty() && result.affinity_class != "auto";
-        const bool has_priority = matcher.get_prio_value(result.prio_class, result.effective_state) != 0;
-        return has_affinity || has_priority || result.enable_limit;
+        return result.matched && (needs_affinity_management(result)
+            || needs_priority_management(result, matcher) || result.enable_limit);
     }
 
     void capture_baseline_if_needed(const DispatchTask& task, ThreadCache& cache,
@@ -361,6 +365,23 @@ private:
         cache.set_baseline(task.pid, task.tid, std::move(baseline));
     }
 
+    bool restore_affinity_baseline(int tid, const ThreadBaseline& baseline,
+                                   CpusetSetter& cpuset) {
+        bool restored = true;
+        if (baseline.has_cpuset_path
+            && !cpuset.restore_cpuset_cgroup(tid, baseline.cpuset_path)) {
+            LOG_W("ScanWorker", name_ + " failed to restore cpuset cgroup for tid "
+                  + std::to_string(tid));
+            restored = false;
+        }
+        if (baseline.has_affinity && !cpuset.restore_affinity(tid, baseline.affinity)) {
+            LOG_W("ScanWorker", name_ + " failed to restore affinity for tid "
+                  + std::to_string(tid));
+            restored = false;
+        }
+        return restored;
+    }
+
     void restore_baseline(int pid, int tid, ThreadCache& cache, CpusetSetter& cpuset,
                           PrioritySetter& prio, CpuctlSetter& cpuctl) {
         const auto baseline = cache.get_baseline(pid, tid);
@@ -380,12 +401,7 @@ private:
             LOG_W("ScanWorker", name_ + " failed to restore scheduler for tid " + std::to_string(tid));
             restored = false;
         }
-        if (baseline->has_cpuset_path && !cpuset.restore_cpuset_cgroup(tid, baseline->cpuset_path)) {
-            LOG_W("ScanWorker", name_ + " failed to restore cpuset cgroup for tid " + std::to_string(tid));
-            restored = false;
-        }
-        if (baseline->has_affinity && !cpuset.restore_affinity(tid, baseline->affinity)) {
-            LOG_W("ScanWorker", name_ + " failed to restore affinity for tid " + std::to_string(tid));
+        if (!restore_affinity_baseline(tid, *baseline, cpuset)) {
             restored = false;
         }
         if (restored) {
@@ -403,15 +419,21 @@ private:
         }
         capture_baseline_if_needed(task, cache, prio);
         const auto baseline = cache.get_baseline(task.pid, task.tid);
-        const bool needs_affinity = !result.affinity_class.empty() && result.affinity_class != "auto";
-        const bool needs_priority = matcher.get_prio_value(result.prio_class, result.effective_state) != 0;
-        const bool needs_cpuset_cgroup = needs_affinity && !result.cpumask_name.empty();
-        if (!baseline || (needs_affinity && !baseline->has_affinity)
-            || (needs_cpuset_cgroup && !baseline->has_cpuset_path)
+        const bool needs_affinity = needs_affinity_management(result);
+        const bool needs_priority = needs_priority_management(result, matcher);
+        if (!baseline || (needs_affinity && (!baseline->has_affinity || !baseline->has_cpuset_path))
             || (needs_priority && !baseline->has_scheduler)
             || (result.enable_limit && !baseline->has_cpuctl_path)) {
             LOG_W("ScanWorker", name_ + " skipped scheduling for tid " + std::to_string(task.tid)
                   + " because its required baseline could not be captured");
+            return;
+        }
+
+        const auto previously_applied = cache.get_applied_result(task.pid, task.tid);
+        if (should_restore_managed_affinity(previously_applied, result)
+            && !restore_affinity_baseline(task.tid, *baseline, cpuset)) {
+            LOG_W("ScanWorker", name_ + " skipped scheduling for tid " + std::to_string(task.tid)
+                  + " because its affinity baseline could not be restored");
             return;
         }
 
@@ -476,7 +498,7 @@ private:
                     return;
                 }
                 bool affinity_changed = false;
-                if (!applied->affinity_class.empty() && applied->affinity_class != "auto") {
+                if (needs_affinity_management(*applied)) {
                     const auto expected_cpus = cpuset->get_cpus_for_affinity(
                         applied->affinity_class, applied->effective_state);
                     affinity_changed = CpuMask::is_affinity_changed(task.tid, expected_cpus);
