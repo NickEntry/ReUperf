@@ -118,10 +118,12 @@ public:
         }
         
         if (!result.affinity_class.empty() && result.affinity_class != "auto") {
-            if (!set_affinity(tid, result.affinity_class, result.effective_state)) {
+            // Attaching to the target cpuset updates the task's allowed CPU mask.
+            // Narrow sched affinity only after that, so disjoint mask transitions work.
+            if (!move_to_cpuset_cgroup(tid, result.cpumask_name)) {
                 return false;
             }
-            return move_to_cpuset_cgroup(tid, result.cpumask_name);
+            return set_affinity(tid, result.affinity_class, result.effective_state);
         }
         
         LOG_D("CpusetSetter", "Skipped cpuset for tid " + std::to_string(tid) 

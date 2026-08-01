@@ -34,9 +34,27 @@ inline bool has_resolved_affinity(const MatchResult& result) {
         && !result.cpumask_name.empty();
 }
 
+inline bool should_restore_managed_component(bool previously_managed,
+                                             bool currently_managed) {
+    return previously_managed && !currently_managed;
+}
+
 inline bool should_restore_managed_affinity(const std::optional<MatchResult>& previous,
                                             const MatchResult& current) {
-    return previous && has_resolved_affinity(*previous) && !has_resolved_affinity(current);
+    return previous && should_restore_managed_component(
+        has_resolved_affinity(*previous), has_resolved_affinity(current));
+}
+
+inline bool should_restore_managed_priority(int previous_priority,
+                                            int current_priority) {
+    return should_restore_managed_component(
+        previous_priority != 0, current_priority != 0);
+}
+
+inline bool should_restore_managed_limit(const std::optional<MatchResult>& previous,
+                                         const MatchResult& current) {
+    return previous && should_restore_managed_component(
+        previous->enable_limit, current.enable_limit);
 }
 
 inline bool is_result_equal(const MatchResult& a, const MatchResult& b) {

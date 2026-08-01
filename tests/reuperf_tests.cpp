@@ -251,6 +251,24 @@ void test_resolved_affinity_detection() {
     still_managed.cpumask_name = "c1";
     require(!should_restore_managed_affinity(previous, still_managed),
             "transition between managed masks requested baseline restoration");
+    MatchResult limited = previous;
+    limited.enable_limit = true;
+    MatchResult unlimited = limited;
+    unlimited.enable_limit = false;
+    require(should_restore_managed_limit(limited, unlimited),
+            "disabled cpuctl limit did not request baseline restoration");
+    require(!should_restore_managed_limit(limited, limited),
+            "active cpuctl limit requested baseline restoration");
+    require(should_restore_managed_priority(120, 0),
+            "disabled priority did not request scheduler restoration");
+    require(!should_restore_managed_priority(120, 98),
+            "transition between managed priorities requested restoration");
+    require(!should_restore_managed_priority(0, 120),
+            "priority activation requested scheduler restoration");
+    require(should_restore_managed_component(true, false),
+            "managed component removal was not detected");
+    require(!should_restore_managed_component(false, true),
+            "component activation requested baseline restoration");
 
     result.affinity_class = "auto";
     result.cpumask_name = "c2";
