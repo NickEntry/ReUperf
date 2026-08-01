@@ -34,6 +34,11 @@ inline bool has_resolved_affinity(const MatchResult& result) {
         && !result.cpumask_name.empty();
 }
 
+inline bool should_dispatch_background_process(const MatchResult& result,
+                                               bool has_baseline) {
+    return result.matched || has_baseline;
+}
+
 inline bool should_restore_managed_component(bool previously_managed,
                                              bool currently_managed) {
     return previously_managed && !currently_managed;
@@ -155,15 +160,16 @@ public:
     }
 
     MatchResult match(const std::string& proc_name, const std::string& thread_name,
-                      ProcessState actual_state, int /*pid*/, const std::string& cmdline = "") {
-        return match_impl(proc_name, thread_name, actual_state, cmdline, "Thread");
+                      ProcessState actual_state, int pid, int tid,
+                      const std::string& cmdline = "") {
+        return match_impl(proc_name, thread_name, actual_state, cmdline, tid == pid, "Thread");
     }
 
     MatchResult match_process_only(const std::string& proc_name,
                                    const std::string& thread_name,
                                    ProcessState actual_state, int /*pid*/,
                                    const std::string& cmdline = "") {
-        return match_impl(proc_name, thread_name, actual_state, cmdline, "Process");
+        return match_impl(proc_name, thread_name, actual_state, cmdline, true, "Process");
     }
 
     std::vector<int> get_cpus_for_affinity(const std::string& affinity_class,
@@ -266,12 +272,13 @@ private:
 
     MatchResult match_impl(const std::string& proc_name, const std::string& thread_name,
                            ProcessState actual_state, const std::string& cmdline,
-                           const char* log_label) {
+                           bool is_main_thread, const char* log_label) {
         MatchResult result;
         result.effective_state = actual_state;
 
         std::string cache_key = proc_name + "#|#" + thread_name + "#|#" + cmdline
-            + "#|#" + std::to_string(static_cast<int>(actual_state));
+            + "#|#" + std::to_string(static_cast<int>(actual_state))
+            + "#|#" + std::to_string(is_main_thread);
         
         if (proc_name == "[dead]") {
             size_t bucket = get_cache_bucket(cache_key);
@@ -334,7 +341,7 @@ private:
             for (size_t i = 0; i < matched_rule->thread_rules.size(); ++i) {
                 const auto& ctr = matched_rule->thread_rules[i];
                 if (ctr.is_main_thread_rule) {
-                    if (thread_name == proc_name) {
+                    if (is_main_thread) {
                         result.affinity_class = ctr.rule.affinity_class;
                         result.prio_class = ctr.rule.prio_class;
                         result.uclamp_max = ctr.rule.uclamp_max;

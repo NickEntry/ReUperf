@@ -550,9 +550,25 @@ inline CgroupState cgroup_paths_to_state(const std::string& cpu_path,
     return cgroup_path_to_state(cpuset_path);
 }
 
+struct CgroupStateInfo {
+    CgroupState state = CgroupState::OTHER;
+    bool reuperf_owned = false;
+};
+
+inline CgroupStateInfo cgroup_paths_to_state_info(const std::string& cpu_path,
+                                                   const std::string& cpuset_path) {
+    const bool reuperf_owned = cpu_path.rfind("/ReUperf/", 0) == 0
+        || cpuset_path.rfind("/ReUperf_", 0) == 0;
+    return {cgroup_paths_to_state(cpu_path, cpuset_path), reuperf_owned};
+}
+
+inline CgroupStateInfo get_cgroup_state_info(int pid) {
+    return cgroup_paths_to_state_info(get_cgroup_path(pid, "cpu"),
+                                      get_cgroup_path(pid, "cpuset"));
+}
+
 inline CgroupState get_cgroup_state(int pid) {
-    return cgroup_paths_to_state(get_cgroup_path(pid, "cpu"),
-                                 get_cgroup_path(pid, "cpuset"));
+    return get_cgroup_state_info(pid).state;
 }
 
 // Write a single thread (TID) to a cgroup's tasks file.

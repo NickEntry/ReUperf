@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "config/config_parser.hpp"
+#include "core/cgroup_init.hpp"
 #include "core/event_router.hpp"
 #include "core/thread_cache.hpp"
 #include "core/thread_matcher.hpp"
@@ -142,6 +143,26 @@ void test_cpu_mask_formatting() {
             "single CPU mask formatting failed");
 }
 
+void test_main_thread_identity() {
+    Config config;
+    ProcessRule process_rule;
+    process_rule.name = "app";
+    process_rule.regex_str = "^app$";
+    process_rule.thread_rules.push_back(ThreadRule{"/MAIN_THREAD/", "main", "auto",
+                                                   std::nullopt, std::nullopt, false});
+    config.sched.rules.push_back(process_rule);
+
+    ThreadMatcher matcher(config);
+    const auto leader = matcher.match("app", "shared-name", ProcessState::FG,
+                                      100, 100, "app");
+    const auto same_name_worker = matcher.match("app", "shared-name", ProcessState::FG,
+                                                100, 101, "app");
+    require(leader.thread_rule_index == 0 && leader.affinity_class == "main",
+            "thread-group leader did not match MAIN_THREAD");
+    require(same_name_worker.thread_rule_index == -1,
+            "same-name worker incorrectly matched MAIN_THREAD");
+}
+
 void test_home_package_regex_is_literal() {
     Config config;
     config.launcher_package = "com.example.home";
@@ -159,6 +180,20 @@ void test_home_package_regex_is_literal() {
         "comXexampleYhome", "comXexampleYhome", ProcessState::FG, 2, "comXexampleYhome");
     require(exact.matched, "HOME_PACKAGE failed to match the exact launcher package");
     require(!wildcard.matched, "HOME_PACKAGE treated dots as regex wildcards");
+}
+
+void test_reuperf_cgroup_state_info() {
+    using FileUtils::CgroupState;
+    const auto owned = FileUtils::cgroup_paths_to_state_info(
+        "/ReUperf/game/A1", "/ReUperf_big");
+    require(owned.state == CgroupState::OTHER && owned.reuperf_owned,
+            "ReUperf-owned controller paths were not identified");
+    const auto external = FileUtils::cgroup_paths_to_state_info("/", "/unknown");
+    require(external.state == CgroupState::OTHER && !external.reuperf_owned,
+            "unrecognized external paths were treated as ReUperf-owned");
+    const auto top = FileUtils::cgroup_paths_to_state_info("/top-app", "/ReUperf_big");
+    require(top.state == CgroupState::TOP,
+            "recognized Android cpu state was hidden by a ReUperf cpuset");
 }
 
 void test_thread_cache_identity() {
@@ -185,6 +220,20 @@ void test_thread_cache_identity() {
     require(cache.get_baseline(10, 11).has_value(), "wrong identity erased a baseline");
     cache.erase_thread_if_identity(10, 11, 100, 200);
     require(!cache.get_baseline(10, 11).has_value(), "matching identity failed to erase cache entry");
+
+    cache.update(20, 21, 300, 400, "old", "cmd", ProcessState::FG,
+                 result, "/dev/cpuset", "/dev/cpuctl");
+    const auto scan_start = cache.identity_snapshot();
+    cache.reset_for_pid(20);
+    cache.update(20, 21, 301, 401, "new", "cmd", ProcessState::TOP,
+                 result, "/dev/cpuset", "/dev/cpuctl");
+    ThreadBaseline new_baseline;
+    new_baseline.affinity = {2};
+    new_baseline.has_affinity = true;
+    cache.set_baseline(20, 21, new_baseline);
+    cache.retain_live_threads({{20, 300}}, {{{20, 21}, 400}}, scan_start);
+    require(cache.get_baseline(20, 21).has_value(),
+            "stale full-scan snapshot erased a newer recycled identity");
 }
 
 void test_priority_policy_mapping() {
@@ -229,6 +278,31 @@ void test_event_router_throttle() {
         require(callback_count == 1, "EventRouter did not aggregate events within throttle window");
     }
     router.stop();
+}
+
+void test_background_dispatch_eligibility() {
+    MatchResult default_rule;
+    default_rule.matched = true;
+    default_rule.matched_rule_name = "Default rule";
+    require(should_dispatch_background_process(default_rule, false),
+            "a matched default rule was excluded from background dispatch");
+
+    MatchResult unmatched;
+    require(!should_dispatch_background_process(unmatched, false),
+            "an unmanaged background process was dispatched without a baseline");
+    require(should_dispatch_background_process(unmatched, true),
+            "an unmatched process with a baseline was not dispatched for restoration");
+}
+
+void test_inherited_limit_resolution() {
+    require(CgroupInitializer::resolve_limit_value(75, "100") == "75",
+            "configured cgroup limit did not override the inherited value");
+    require(CgroupInitializer::resolve_limit_value(std::nullopt, "100") == "100",
+            "omitted cgroup limit did not reset to the inherited value");
+    require(CgroupInitializer::cpuset_group_requires_rollback("0-7", "0"),
+            "complete existing cpuset was not protected by rollback");
+    require(!CgroupInitializer::cpuset_group_requires_rollback("0-7", ""),
+            "half-initialized cpuset was treated as a valid rollback baseline");
 }
 
 void test_resolved_affinity_detection() {
@@ -336,8 +410,12 @@ int main() {
     test_config_validation();
     test_timing_config();
     test_cpu_mask_formatting();
+    test_main_thread_identity();
     test_home_package_regex_is_literal();
+    test_reuperf_cgroup_state_info();
     test_thread_cache_identity();
+    test_background_dispatch_eligibility();
+    test_inherited_limit_resolution();
     test_resolved_affinity_detection();
     test_match_result_equality();
     test_priority_policy_mapping();

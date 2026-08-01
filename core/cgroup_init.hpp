@@ -4,10 +4,11 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <map>
+#include <optional>
+#include <set>
 #include <string>
 #include <vector>
-#include <map>
-#include <set>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -17,15 +18,79 @@
 #include "../utils/cpu_mask.hpp"
 
 class CgroupInitializer {
+    class ControlFileTransaction {
+    public:
+        ~ControlFileTransaction() {
+            if (finalized_) return;
+            try {
+                (void)rollback();
+            } catch (...) {
+                // Destructors must not throw while unwinding another initialization failure.
+            }
+        }
+
+        bool write(const std::string& path, const std::string& value,
+                   bool rollback_required = true) {
+            if (rollback_required && original_values_.find(path) == original_values_.end()) {
+                const std::string original = FileUtils::read_file(path);
+                if (original.empty()) {
+                    LOG_W("CgroupInit", "Cannot snapshot control file before update: " + path);
+                    return false;
+                }
+                original_values_.emplace(path, original);
+                write_order_.push_back(path);
+            }
+            return FileUtils::write_kernel_control_file(path, value);
+        }
+
+        bool rollback() {
+            if (finalized_) return true;
+            finalized_ = true;
+            bool success = true;
+            for (auto it = write_order_.rbegin(); it != write_order_.rend(); ++it) {
+                const auto original = original_values_.find(*it);
+                if (original == original_values_.end()) continue;
+                if (!FileUtils::write_kernel_control_file(*it, original->second)) {
+                    LOG_E("CgroupInit", "Failed to roll back control file: " + *it);
+                    success = false;
+                }
+            }
+            return success;
+        }
+
+        void commit() {
+            finalized_ = true;
+        }
+
+    private:
+        bool finalized_ = false;
+        std::map<std::string, std::string> original_values_;
+        std::vector<std::string> write_order_;
+    };
+
 public:
     static bool init(const Config& config) {
-        bool success = true;
-        
-        success &= init_cpuset(config);
-        success &= init_cpuctl(config);
+        ControlFileTransaction transaction;
+        if (!init_cpuset(config, transaction) || !init_cpuctl(config, transaction)) {
+            LOG_W("CgroupInit", "Cgroup initialization failed; rolling back control values");
+            if (!transaction.rollback()) {
+                LOG_E("CgroupInit", "Cgroup control value rollback was incomplete");
+            }
+            return false;
+        }
         report_stale_groups(config);
+        transaction.commit();
+        return true;
+    }
 
-        return success;
+    static std::string resolve_limit_value(const std::optional<int>& configured,
+                                           const std::string& inherited) {
+        return configured ? std::to_string(*configured) : inherited;
+    }
+
+    static bool cpuset_group_requires_rollback(const std::string& cpus,
+                                               const std::string& mems) {
+        return !cpus.empty() && !mems.empty();
     }
 
 private:
@@ -83,180 +148,173 @@ private:
         }
         return false;
     }
-    
-    static bool init_cpuset(const Config& config) {
+
+    static bool write_optional_limit(ControlFileTransaction& transaction,
+                                     const std::string& child_path,
+                                     const std::string& parent_path,
+                                     const std::string& filename,
+                                     const std::optional<int>& configured) {
+        const std::string child_file = child_path + "/" + filename;
+        if (!FileUtils::file_exists(child_file)) {
+            if (configured) {
+                LOG_W("CgroupInit", "Required control file not found: " + child_file);
+                return false;
+            }
+            return true;
+        }
+
+        std::string inherited;
+        if (!configured) {
+            inherited = FileUtils::read_file(parent_path + "/" + filename);
+            if (inherited.empty()) {
+                LOG_W("CgroupInit", "Cannot read inherited value for " + child_file);
+                return false;
+            }
+        }
+        const std::string desired = resolve_limit_value(configured, inherited);
+        if (!transaction.write(child_file, desired)) {
+            LOG_W("CgroupInit", "Failed to configure " + child_file);
+            return false;
+        }
+        return true;
+    }
+
+    static bool init_cpuset(const Config& config, ControlFileTransaction& transaction) {
         LOG_I("CgroupInit", "Initializing cpuset cgroups...");
-        
+
         if (!FileUtils::dir_exists("/dev/cpuset")) {
             LOG_W("CgroupInit", "/dev/cpuset not found, skipping cpuset init");
             return true;
         }
-        
         if (!FileUtils::file_exists("/dev/cpuset/cpus")) {
             LOG_W("CgroupInit", "cpuset not properly mounted (missing /dev/cpuset/cpus), skipping");
             return true;
         }
-        
-        // 检测所有物理 CPU 核心
-        std::string all_cpus = CpuMask::get_all_cpus_string();
+
+        const std::string all_cpus = CpuMask::get_all_cpus_string();
         LOG_I("CgroupInit", "Detected all CPUs: " + all_cpus);
         if (all_cpus.empty()) {
             LOG_E("CgroupInit", "No CPUs detected, cannot initialize cpuset");
             return false;
         }
-        
-        std::string base_path = "/dev/cpuset";
-        std::string root_mems = FileUtils::read_file(base_path + "/mems");
+
+        const std::string base_path = "/dev/cpuset";
+        const std::string root_mems = FileUtils::read_file(base_path + "/mems");
         if (root_mems.empty()) {
             LOG_E("CgroupInit", "Root cpuset mems is empty or unreadable");
             return false;
         }
-        int created = 0, failed = 0;
-        
-        // 创建各规则子组，命名格式：ReUperf_<cpumask_name>（例如 ReUperf_all）
+        int created = 0;
+        int failed = 0;
+
         for (const auto& cpumask : config.sched.cpumask) {
-            std::string child_path = base_path + "/ReUperf_" + cpumask.first;
-            
+            const std::string child_path = base_path + "/ReUperf_" + cpumask.first;
+            const bool group_was_ready = FileUtils::dir_exists(child_path)
+                && cpuset_group_requires_rollback(
+                    FileUtils::read_file(child_path + "/cpus"),
+                    FileUtils::read_file(child_path + "/mems"));
             if (!FileUtils::mkdir_recursive(child_path)) {
                 LOG_W("CgroupInit", "Failed to create cpuset: " + child_path);
-                failed++;
+                ++failed;
                 continue;
             }
-            
-            if (!ensure_cgroup_file_exists(child_path + "/cpus")) {
-                LOG_W("CgroupInit", "cpuset control files not created for " + child_path);
-                failed++;
-                continue;
-            }
-            
-            std::string cpus_str = CpuMask::to_string(cpumask.second);
-            if (cpus_str.empty()) {
-                LOG_W("CgroupInit", "Empty cpumask for " + cpumask.first + ", skipping");
-                continue;
-            }
-            
-            if (!FileUtils::write_kernel_control_file(child_path + "/cpus", cpus_str)) {
-                LOG_W("CgroupInit", "Failed to set cpus for " + child_path 
-                      + " (cpus=" + cpus_str + ")");
-                failed++;
-                continue;
-            }
-            
-            LOG_D("CgroupInit", "Set " + child_path + "/cpus = " + cpus_str);
-            
-            if (!ensure_cgroup_file_exists(child_path + "/mems")
+            if (!ensure_cgroup_file_exists(child_path + "/cpus")
+                || !ensure_cgroup_file_exists(child_path + "/mems")
                 || !ensure_cgroup_file_exists(child_path + "/tasks")) {
                 LOG_W("CgroupInit", "Required cpuset control files missing for " + child_path);
-                failed++;
+                ++failed;
                 continue;
             }
-            if (!FileUtils::write_kernel_control_file(child_path + "/mems", root_mems)) {
+
+            const std::string cpus_str = CpuMask::to_string(cpumask.second);
+            if (cpus_str.empty()) {
+                LOG_W("CgroupInit", "Empty cpumask for " + cpumask.first);
+                ++failed;
+                continue;
+            }
+            if (!transaction.write(child_path + "/cpus", cpus_str, group_was_ready)) {
+                LOG_W("CgroupInit", "Failed to set cpus for " + child_path
+                      + " (cpus=" + cpus_str + ")");
+                ++failed;
+                continue;
+            }
+            if (!transaction.write(child_path + "/mems", root_mems, group_was_ready)) {
                 LOG_W("CgroupInit", "Failed to set mems for " + child_path);
-                failed++;
+                ++failed;
                 continue;
             }
-            LOG_D("CgroupInit", "Set " + child_path + "/mems = " + root_mems);
-            
-            created++;
-            
-            // ReUperf masks intentionally overlap. Keep these groups non-exclusive so
-            // their CPU and memory-node sets remain valid on cpuset v1 kernels.
-            if (FileUtils::file_exists(child_path + "/cpu_exclusive")) {
-                int fd = open((child_path + "/cpu_exclusive").c_str(), O_WRONLY);
-                if (fd >= 0) {
-                    const char* v = "0";
-                    ssize_t written = write(fd, v, 1);
-                    int err = errno;
-                    close(fd);
-                    if (written != 1) {
-                        LOG_W("CgroupInit", "Failed to disable cpu_exclusive: " + std::string(strerror(err)));
-                    }
+
+            bool exclusive_ready = true;
+            for (const char* filename : {"cpu_exclusive", "mem_exclusive"}) {
+                const std::string control_file = child_path + "/" + filename;
+                if (FileUtils::file_exists(control_file)
+                    && !transaction.write(control_file, "0", group_was_ready)) {
+                    LOG_W("CgroupInit", "Failed to disable " + std::string(filename)
+                          + " for " + child_path);
+                    exclusive_ready = false;
                 }
             }
-            if (FileUtils::file_exists(child_path + "/mem_exclusive")) {
-                int fd = open((child_path + "/mem_exclusive").c_str(), O_WRONLY);
-                if (fd >= 0) {
-                    const char* v = "0";
-                    ssize_t written = write(fd, v, 1);
-                    int err = errno;
-                    close(fd);
-                    if (written != 1) {
-                        LOG_W("CgroupInit", "Failed to disable mem_exclusive: " + std::string(strerror(err)));
-                    }
-                }
+            if (!exclusive_ready) {
+                ++failed;
+                continue;
             }
+            ++created;
         }
-        
+
         LOG_I("CgroupInit", "cpuset cgroups: " + std::to_string(created)
               + " groups created, " + std::to_string(failed) + " failed");
         return failed == 0;
     }
 
-    static bool init_cpuctl(const Config& config) {
+    static bool init_cpuctl(const Config& config, ControlFileTransaction& transaction) {
         LOG_I("CgroupInit", "Initializing cpuctl cgroups...");
-        
+
         if (!FileUtils::dir_exists("/dev/cpuctl")) {
             LOG_W("CgroupInit", "/dev/cpuctl not found, skipping cpuctl init");
             return true;
         }
-        
-        std::string base_path = "/dev/cpuctl";
-        
-        // 在根目录创建 ReUperf 组（不受子集 cpus 限制）
-        std::string reuperf_path = base_path + "/ReUperf";
+
+        const std::string reuperf_path = "/dev/cpuctl/ReUperf";
         if (!FileUtils::mkdir_recursive(reuperf_path)) {
             LOG_W("CgroupInit", "Failed to create " + reuperf_path);
             return false;
         }
-        
-        int failed = 0;
 
-        // 创建各规则子组，以及每个线程规则的 A{index} 子组
+        int failed = 0;
         for (const auto& rule : config.sched.rules) {
-            std::string rule_path = reuperf_path + "/" + rule.name;
-            
+            const std::string rule_path = reuperf_path + "/" + rule.name;
             if (!FileUtils::mkdir_recursive(rule_path)) {
                 LOG_W("CgroupInit", "Failed to create cpuctl: " + rule_path);
-                failed++;
+                ++failed;
                 continue;
             }
-            
-            LOG_D("CgroupInit", "Created cpuctl group: " + rule_path);
 
-            // Create A{index} subdirectories for each thread rule with enable_limit
             for (size_t i = 0; i < rule.thread_rules.size(); ++i) {
-                const auto& tr = rule.thread_rules[i];
-                if (!tr.enable_limit) continue;
+                const auto& thread_rule = rule.thread_rules[i];
+                if (!thread_rule.enable_limit) continue;
 
-                std::string sub_path = rule_path + "/A" + std::to_string(i + 1);
+                const std::string sub_path = rule_path + "/A" + std::to_string(i + 1);
                 if (!FileUtils::mkdir_recursive(sub_path)) {
                     LOG_W("CgroupInit", "Failed to create cpuctl: " + sub_path);
-                    failed++;
+                    ++failed;
                     continue;
                 }
 
-                if (tr.uclamp_max.has_value()) {
-                    std::string uclamp_path = sub_path + "/cpu.uclamp.max";
-                    if (!FileUtils::file_exists(uclamp_path)
-                        || !FileUtils::write_kernel_control_file(uclamp_path, std::to_string(tr.uclamp_max.value()))) {
-                        LOG_W("CgroupInit", "Failed to configure " + uclamp_path);
-                        failed++;
-                    }
+                bool configured = true;
+                configured &= write_optional_limit(transaction, sub_path, rule_path,
+                                                   "cpu.uclamp.max", thread_rule.uclamp_max);
+                configured &= write_optional_limit(transaction, sub_path, rule_path,
+                                                   "cpu.shares", thread_rule.cpu_share);
+                if (!configured) {
+                    ++failed;
+                    continue;
                 }
-                if (tr.cpu_share.has_value()) {
-                    std::string shares_path = sub_path + "/cpu.shares";
-                    if (!FileUtils::file_exists(shares_path)
-                        || !FileUtils::write_kernel_control_file(shares_path, std::to_string(tr.cpu_share.value()))) {
-                        LOG_W("CgroupInit", "Failed to configure " + shares_path);
-                        failed++;
-                    }
-                }
-
-                LOG_D("CgroupInit", "Created cpuctl sub-group: " + sub_path);
+                LOG_D("CgroupInit", "Configured cpuctl sub-group: " + sub_path);
             }
         }
-        
-        LOG_I("CgroupInit", "cpuctl cgroups initialized, " + std::to_string(failed) + " failures");
+
+        LOG_I("CgroupInit", "cpuctl cgroups initialized, " + std::to_string(failed)
+              + " failures");
         return failed == 0;
     }
 };

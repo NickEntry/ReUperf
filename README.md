@@ -9,7 +9,7 @@ ReUperf 是一个面向 Android 的线程级调度器，使用 uperf 风格的 J
 - 为单个 TID 设置 cpuset、CPU affinity、scheduler policy、priority 和 nice。
 - 可选配置 `cpu.uclamp.max` 与 `cpu.shares`。
 - 保存线程原始调度状态，在规则、进程状态、配置或程序生命周期变化时恢复对应 baseline。
-- 支持运行中重新加载配置以及 Magisk 模块安装。
+- 支持运行中事务式重新加载配置以及 Magisk 模块安装；切换前恢复旧线程状态，控制文件更新失败时回滚旧值。
 
 ## 运行环境条件
 
@@ -85,8 +85,11 @@ ReUperf 分别跟踪 affinity/cpuset、scheduler priority 和 cpuctl limit：
 - 应用有效 affinity 时，先迁入目标 cpuset，再设置目标 affinity；因此不同且互不相交的有效 CPU mask 之间可以直接切换。
 - priority 从受管理值变为 `0` 时，恢复原始 scheduler policy、priority 和 nice。
 - `enable_limit` 从 `true` 变为 `false` 时，恢复原始 cpuctl cgroup。
+- 热重载中若保留 `enable_limit=true` 但省略 `uclamp_max` 或 `cpu_share`，对应控制值会显式恢复为父 cgroup 的继承值，不沿用旧子组残留值。
 - 当线程完全不再受任何调度维度管理时，恢复完整 baseline。
 - 所有恢复均结合 PID/TID start time 校验，避免将旧状态应用到复用的 ID。
+- `/MAIN_THREAD/` 按线程组 leader 身份（`tid == pid`）匹配，不依赖可能重复的线程名称。
+- 当 ReUperf 自建 cgroup 暂时覆盖可见的 Android 状态路径时，仅对同一进程身份沿用最近一次已识别状态。
 
 ## 运行检查
 

@@ -182,10 +182,29 @@ public:
         return baselines;
     }
 
-    void retain_live_threads(const std::map<int, uint64_t>& live_processes,
-                             const std::map<std::pair<int, int>, uint64_t>& live_threads) {
+    std::map<std::pair<int, int>, std::pair<uint64_t, uint64_t>> identity_snapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::map<std::pair<int, int>, std::pair<uint64_t, uint64_t>> identities;
+        for (const auto& [key, entry] : cache_) {
+            identities.emplace(key, std::make_pair(entry.process_start_time,
+                                                    entry.thread_start_time));
+        }
+        return identities;
+    }
+
+    void retain_live_threads(
+        const std::map<int, uint64_t>& live_processes,
+        const std::map<std::pair<int, int>, uint64_t>& live_threads,
+        const std::map<std::pair<int, int>, std::pair<uint64_t, uint64_t>>& scan_start_identities) {
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto it = cache_.begin(); it != cache_.end();) {
+            const auto original = scan_start_identities.find(it->first);
+            if (original == scan_start_identities.end()
+                || original->second.first != it->second.process_start_time
+                || original->second.second != it->second.thread_start_time) {
+                ++it;
+                continue;
+            }
             const auto process = live_processes.find(it->second.pid);
             if (process == live_processes.end() || process->second != it->second.process_start_time) {
                 // The owning process is confirmed dead or recycled, so restoration is unsafe.

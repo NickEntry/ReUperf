@@ -556,7 +556,7 @@ private:
         }
 
         const MatchResult result = matcher->match(task.proc_name, task.thread_name,
-                                                   task.state, task.pid, task.cmdline);
+                                                   task.state, task.pid, task.tid, task.cmdline);
         const std::string cpuctl_base = cpuctl->get_cpuctl_base(result.effective_state);
         cache->update(task.pid, task.tid, task.process_start_time, task.thread_start_time,
                       task.thread_name, task.cmdline,

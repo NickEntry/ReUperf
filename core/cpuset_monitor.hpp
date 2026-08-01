@@ -19,6 +19,7 @@
 class ProcMonitor {
 public:
     using Callback = std::function<void(int pid)>;
+    using OverflowCallback = std::function<void()>;
 
     ProcMonitor() : running_(false), started_(false), inotify_fd_(-1), stop_fd_(-1) {}
 
@@ -26,7 +27,7 @@ public:
         stop();
     }
 
-    bool start(Callback on_process_change) {
+    bool start(Callback on_process_change, OverflowCallback on_events_dropped = {}) {
         if (started_.load()) {
             LOG_W("ProcMonitor", "start() called while already running, ignoring");
             return true;
@@ -39,6 +40,7 @@ public:
         }
 
         on_process_change_ = std::move(on_process_change);
+        on_events_dropped_ = std::move(on_events_dropped);
         inotify_fd_ = inotify_init1(IN_CLOEXEC);
         if (inotify_fd_ < 0) {
             LOG_W("ProcMonitor", "inotify_init1 failed: " + std::string(strerror(errno)));
@@ -121,6 +123,7 @@ private:
     int stop_fd_;
     std::thread thread_;
     Callback on_process_change_;
+    OverflowCallback on_events_dropped_;
 
     void monitor_loop() {
         constexpr size_t kEventSize = sizeof(inotify_event);
@@ -169,7 +172,10 @@ private:
                     LOG_W("ProcMonitor", "Truncated inotify event record");
                     break;
                 }
-                if (event->len > 0) {
+                if (event->mask & IN_Q_OVERFLOW) {
+                    LOG_W("ProcMonitor", "inotify queue overflow; requesting a compensating full scan");
+                    if (on_events_dropped_) on_events_dropped_();
+                } else if (event->len > 0) {
                     const std::string name(event->name, strnlen(event->name, event->len));
                     if (FileUtils::is_all_digits(name.c_str())) {
                         errno = 0;

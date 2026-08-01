@@ -254,9 +254,11 @@ using PinnedCache = PidCache;
 using TopForeCache = PidCache;
 
 struct ScanBudget {
-    explicit ScanBudget(int budget_us, int batch_size, int batch_yield_us)
+    explicit ScanBudget(int budget_us, int configured_batch_size,
+                        int configured_batch_yield_us)
         : deadline(std::chrono::steady_clock::now() + std::chrono::microseconds(budget_us)),
-          batch_size(std::max(batch_size, 1)), batch_yield_us(std::max(batch_yield_us, 0)) {}
+          batch_size(std::max(configured_batch_size, 1)),
+          batch_yield_us(std::max(configured_batch_yield_us, 0)) {}
 
     bool exhausted() const {
         return std::chrono::steady_clock::now() >= deadline;
@@ -298,6 +300,9 @@ struct FullScanState {
     std::set<int> baseline_pids;
     std::map<int, uint64_t> live_processes;
     std::map<std::pair<int, int>, uint64_t> live_threads;
+    std::map<std::pair<int, int>, std::pair<uint64_t, uint64_t>> scan_start_identities;
+    std::map<int, std::pair<uint64_t, ProcessState>> previous_states;
+    std::map<int, std::pair<uint64_t, ProcessState>> observed_states;
     std::set<int> pinned_pids;
     std::set<int> topfore_pids;
     std::set<int> top_app_pids;
@@ -313,10 +318,13 @@ struct FullScanState {
         reset();
     }
 
-    void begin(ThreadCache& cache) {
+    void begin(ThreadCache& cache,
+               const std::map<int, std::pair<uint64_t, ProcessState>>& prior_states) {
         reset();
         active = true;
         baseline_pids = cache.get_pids_with_baselines();
+        scan_start_identities = cache.identity_snapshot();
+        previous_states = prior_states;
     }
 
     bool enumerate_pids(ScanBudget& budget) {
@@ -436,6 +444,9 @@ struct FullScanState {
         baseline_pids.clear();
         live_processes.clear();
         live_threads.clear();
+        scan_start_identities.clear();
+        previous_states.clear();
+        observed_states.clear();
         pinned_pids.clear();
         topfore_pids.clear();
         top_app_pids.clear();
@@ -448,7 +459,7 @@ struct FullScanState {
 bool advance_full_scan(ThreadMatcher& matcher, ThreadCache& cache,
                        FullScanState& scan, ScanBudget& budget) {
     if (!scan.active) {
-        scan.begin(cache);
+        return false;
     }
     if (!scan.enumerate_pids(budget)) {
         return false;
@@ -477,14 +488,27 @@ bool advance_full_scan(ThreadMatcher& matcher, ThreadCache& cache,
                 continue;
             }
 
-            scan.live_processes.emplace(pid, scan.current_process_start_time);
+            scan.live_processes[pid] = scan.current_process_start_time;
             scan.current_cmdline = FileUtils::get_process_cmdline(pid);
-            const FileUtils::CgroupState cg_state = FileUtils::get_cgroup_state(pid);
-            if (cg_state == FileUtils::CgroupState::TOP) {
+            const FileUtils::CgroupStateInfo cgroup = FileUtils::get_cgroup_state_info(pid);
+            if (cgroup.state == FileUtils::CgroupState::TOP) {
                 scan.current_state = ProcessState::TOP;
-                scan.top_app_pids.insert(pid);
-            } else if (cg_state == FileUtils::CgroupState::FG) {
+            } else if (cgroup.state == FileUtils::CgroupState::FG) {
                 scan.current_state = ProcessState::FG;
+            } else if (cgroup.state == FileUtils::CgroupState::BG) {
+                scan.current_state = ProcessState::BG;
+            } else if (const auto previous = scan.previous_states.find(pid);
+                       cgroup.reuperf_owned && previous != scan.previous_states.end()
+                       && previous->second.first == scan.current_process_start_time) {
+                // ReUperf may replace both visible controller paths. Preserve only the
+                // state of the same process identity while those paths remain ours.
+                scan.current_state = previous->second.second;
+            }
+            scan.observed_states[pid] = {scan.current_process_start_time,
+                                         scan.current_state};
+            if (scan.current_state == ProcessState::TOP) {
+                scan.top_app_pids.insert(pid);
+            } else if (scan.current_state == ProcessState::FG) {
                 scan.foreground_pids.insert(pid);
             }
         }
@@ -501,17 +525,31 @@ bool advance_full_scan(ThreadMatcher& matcher, ThreadCache& cache,
         }
 
         if (budget.exhausted()) return false;
+        const uint64_t verified_start_time = FileUtils::get_process_start_time(pid);
+        if (verified_start_time != scan.current_process_start_time) {
+            scan.live_processes.erase(pid);
+            for (auto it = scan.live_threads.begin(); it != scan.live_threads.end();) {
+                if (it->first.first == pid) it = scan.live_threads.erase(it);
+                else ++it;
+            }
+            scan.top_app_pids.erase(pid);
+            scan.foreground_pids.erase(pid);
+            scan.background_pids.erase(pid);
+            scan.observed_states.erase(pid);
+            scan.pinned_pids.erase(pid);
+            scan.topfore_pids.erase(pid);
+            scan.clear_current_pid();
+            continue;
+        }
         const MatchResult result = matcher.match_process_only(
             scan.current_proc_name, scan.current_proc_name, scan.current_state,
             pid, scan.current_cmdline);
-        if (!result.matched || result.matched_rule_name == "Default rule") {
-            if (scan.current_state == ProcessState::BG && scan.baseline_pids.count(pid) > 0) {
-                scan.background_pids.insert(pid);
-            }
-        } else {
-            if (scan.current_state == ProcessState::BG) {
-                scan.background_pids.insert(pid);
-            }
+        if (scan.current_state == ProcessState::BG
+            && should_dispatch_background_process(
+                result, scan.baseline_pids.count(pid) > 0)) {
+            scan.background_pids.insert(pid);
+        }
+        if (result.matched) {
             if (result.pinned) {
                 scan.pinned_pids.insert(pid);
             }
@@ -524,7 +562,8 @@ bool advance_full_scan(ThreadMatcher& matcher, ThreadCache& cache,
         scan.clear_current_pid();
     }
 
-    cache.retain_live_threads(scan.live_processes, scan.live_threads);
+    cache.retain_live_threads(scan.live_processes, scan.live_threads,
+                              scan.scan_start_identities);
     return true;
 }
 
@@ -657,8 +696,9 @@ void cleanup_dead_pids(ThreadCache& cache, PinnedCache& pinned_cache,
     }
 }
 
-void restore_all_thread_baselines(ThreadCache& cache, CpusetSetter& cpuset,
+bool restore_all_thread_baselines(ThreadCache& cache, CpusetSetter& cpuset,
                                   PrioritySetter& prio, CpuctlSetter& cpuctl) {
+    bool all_restored = true;
     for (const auto& entry : cache.get_all_baselines()) {
         const int pid = entry.pid;
         const int tid = entry.tid;
@@ -694,8 +734,44 @@ void restore_all_thread_baselines(ThreadCache& cache, CpusetSetter& cpuset,
         if (restored) {
             cache.clear_baseline(pid, tid);
             cache.clear_applied_result(pid, tid);
+        } else {
+            all_restored = false;
         }
     }
+    return all_restored;
+}
+
+void stop_all_workers(std::vector<std::unique_ptr<ScanWorker>>& workers,
+                      const std::string& context) noexcept {
+    for (auto& worker : workers) {
+        try {
+            worker->stop();
+        } catch (const std::exception& e) {
+            LOG_E("Main", context + ": worker stop failed: " + e.what());
+        } catch (...) {
+            LOG_E("Main", context + ": worker stop failed with an unknown exception");
+        }
+    }
+}
+
+bool start_all_workers(std::vector<std::unique_ptr<ScanWorker>>& workers,
+                       const std::string& context) {
+    try {
+        for (auto& worker : workers) {
+            if (!worker->start()) {
+                LOG_E("Main", context + ": worker start returned false");
+                stop_all_workers(workers, context);
+                return false;
+            }
+        }
+        return true;
+    } catch (const std::exception& e) {
+        LOG_E("Main", context + ": worker start failed: " + e.what());
+    } catch (...) {
+        LOG_E("Main", context + ": worker start failed with an unknown exception");
+    }
+    stop_all_workers(workers, context);
+    return false;
 }
 
 bool resolve_allowed_config_path(const std::string& user_path, const std::string& allowed_dir,
@@ -798,6 +874,7 @@ int main(int argc, char* argv[]) {
     std::set<int> cached_top_app_pids;
     std::set<int> cached_foreground_pids;
     std::set<int> cached_background_pids;
+    std::map<int, std::pair<uint64_t, ProcessState>> cached_process_states;
 
     LOG_I("Main", "Initial scan...");
     
@@ -812,9 +889,12 @@ int main(int argc, char* argv[]) {
     workers.push_back(std::make_unique<ScanWorker>("ScanWorker3", config.sched.timing));
     workers.push_back(std::make_unique<ScanWorker>("ScanWorker4", config.sched.timing));
     
-    for (auto& w : workers) {
-        w->set_configs(matcher_ptr, cpuset_ptr, prio_ptr, cpuctl_ptr, cache_ptr);
-        w->start();
+    for (auto& worker : workers) {
+        worker->set_configs(matcher_ptr, cpuset_ptr, prio_ptr, cpuctl_ptr, cache_ptr);
+    }
+    if (!start_all_workers(workers, "Starting initial workers")) {
+        LOG_E("Main", "Failed to start scheduler workers");
+        return 1;
     }
     
     // The initial scan uses the same resumable, budgeted state machine as periodic scans.
@@ -835,11 +915,13 @@ int main(int argc, char* argv[]) {
         for (int pid : recycled_pids) {
             LOG_I("Main", "PID recycled, clearing cached thread state: " + std::to_string(pid));
             cache_ptr->reset_for_pid(pid);
+            cached_process_states.erase(pid);
             FileUtils::invalidate_process_caches(pid);
         }
         for (int pid : new_pids) {
             if (pid > 0) {
                 cache_ptr->reset_for_pid(pid);
+                cached_process_states.erase(pid);
                 FileUtils::invalidate_process_caches(pid);
                 LOG_I("Main", "Incremental dispatch for new pid: " + std::to_string(pid));
                 const std::set<int> single_pid = {pid};
@@ -854,24 +936,34 @@ int main(int argc, char* argv[]) {
                 const std::string cmdline = FileUtils::get_process_cmdline(pid);
                 const FileUtils::CgroupState cg_state = FileUtils::get_cgroup_state(pid);
                 ProcessState actual_state = ProcessState::BG;
+                bool initial_dispatch_incomplete = false;
                 if (cg_state == FileUtils::CgroupState::TOP) {
                     actual_state = ProcessState::TOP;
-                    dispatch_top_app_to_workers(workers, single_pid, processed, budget, cursor);
+                    initial_dispatch_incomplete = dispatch_top_app_to_workers(
+                        workers, single_pid, processed, budget, cursor);
                 } else if (cg_state == FileUtils::CgroupState::FG) {
                     actual_state = ProcessState::FG;
                 }
                 const MatchResult result = matcher_ptr->match_process_only(
                     proc_name, proc_name, actual_state, pid, cmdline);
-                if (result.matched && result.matched_rule_name != "Default rule") {
+                bool rule_dispatch_incomplete = false;
+                if (result.matched) {
                     if (result.pinned) {
-                        dispatch_pinned_to_workers(workers, single_pid, processed, budget, cursor);
+                        rule_dispatch_incomplete = dispatch_pinned_to_workers(
+                            workers, single_pid, processed, budget, cursor);
                     } else if (result.topfore && actual_state == ProcessState::FG) {
-                        dispatch_topfore_to_workers(workers, single_pid, processed, budget, cursor);
+                        rule_dispatch_incomplete = dispatch_topfore_to_workers(
+                            workers, single_pid, processed, budget, cursor);
                     } else if (actual_state == ProcessState::FG) {
-                        dispatch_foreground_to_workers(workers, single_pid, processed, budget, cursor);
+                        rule_dispatch_incomplete = dispatch_foreground_to_workers(
+                            workers, single_pid, processed, budget, cursor);
                     } else if (actual_state == ProcessState::BG) {
-                        dispatch_background_to_workers(workers, single_pid, processed, budget, cursor);
+                        rule_dispatch_incomplete = dispatch_background_to_workers(
+                            workers, single_pid, processed, budget, cursor);
                     }
+                }
+                if (initial_dispatch_incomplete || rule_dispatch_incomplete) {
+                    full_rescan_needed.store(true, std::memory_order_release);
                 }
             }
         }
@@ -887,13 +979,15 @@ int main(int argc, char* argv[]) {
     ProcMonitor monitor;
     const auto start_proc_monitor = [&]() {
         return monitor.start([&](int pid) {
-        if (pid > 0) {
-            LOG_D("Main", "Process created: " + std::to_string(pid));
-            g_event_router->on_process_created(pid);
-        } else if (pid < 0) {
-            LOG_D("Main", "Process exited: " + std::to_string(-pid));
-            g_event_router->on_process_exited(-pid);
-        }
+            if (pid > 0) {
+                LOG_D("Main", "Process created: " + std::to_string(pid));
+                g_event_router->on_process_created(pid);
+            } else if (pid < 0) {
+                LOG_D("Main", "Process exited: " + std::to_string(-pid));
+                g_event_router->on_process_exited(-pid);
+            }
+        }, []() {
+            full_rescan_needed.store(true, std::memory_order_release);
         });
     };
     if (!start_proc_monitor()) {
@@ -977,104 +1071,119 @@ int main(int argc, char* argv[]) {
                         reload_succeeded = true;
                     } else {
                         new_config.launcher_package = LauncherFinder::find();
-                        if (!CgroupInitializer::init(new_config)) {
-                            LOG_E("Main", "Cgroup initialization failed; keeping old config");
+                        auto new_matcher = std::make_shared<ThreadMatcher>(new_config);
+                        auto new_cpuset = std::make_shared<CpusetSetter>(
+                            *new_matcher, new_config.sched.timing);
+                        auto new_prio = std::make_shared<PrioritySetter>(*new_matcher);
+                        auto new_cpuctl = std::make_shared<CpuctlSetter>();
+                        std::vector<std::unique_ptr<ScanWorker>> new_workers;
+                        for (int index = 1; index <= 4; ++index) {
+                            auto worker = std::make_unique<ScanWorker>(
+                                "ScanWorker" + std::to_string(index), new_config.sched.timing);
+                            worker->set_configs(new_matcher, new_cpuset, new_prio,
+                                                new_cpuctl, cache_ptr);
+                            new_workers.push_back(std::move(worker));
+                        }
+
+                        std::lock_guard<std::mutex> scheduler_lock(scheduler_state_mutex);
+                        auto old_workers = std::move(workers);
+                        stop_all_workers(old_workers, "Stopping old workers for reload");
+
+                        bool baselines_restored = false;
+                        bool new_cgroups_ready = false;
+                        bool new_workers_started = false;
+                        try {
+                            baselines_restored = restore_all_thread_baselines(
+                                *cache_ptr, *cpuset_ptr, *prio_ptr, *cpuctl_ptr);
+                            if (!baselines_restored) {
+                                LOG_E("Main", "Baseline restoration failed; keeping old config");
+                            } else {
+                                new_cgroups_ready = CgroupInitializer::init(new_config);
+                                if (!new_cgroups_ready) {
+                                    LOG_E("Main", "Cgroup initialization failed; keeping old config");
+                                } else {
+                                    new_workers_started = start_all_workers(
+                                        new_workers, "Starting replacement workers");
+                                }
+                            }
+                        } catch (const std::exception& e) {
+                            LOG_E("Main", "Replacement scheduler preparation failed: "
+                                  + std::string(e.what()) + "; restoring old scheduler");
+                        } catch (...) {
+                            LOG_E("Main", "Replacement scheduler preparation failed with an unknown exception; restoring old scheduler");
+                        }
+
+                        if (!baselines_restored || !new_cgroups_ready || !new_workers_started) {
+                            workers = std::move(old_workers);
+                            bool old_cgroups_ready = !baselines_restored;
+                            bool old_workers_started = false;
+                            try {
+                                if (!old_cgroups_ready) {
+                                    old_cgroups_ready = CgroupInitializer::init(config);
+                                }
+                                if (old_cgroups_ready) {
+                                    old_workers_started = start_all_workers(
+                                        workers, "Restarting old workers");
+                                }
+                            } catch (const std::exception& e) {
+                                LOG_E("Main", "Old scheduler recovery failed: "
+                                      + std::string(e.what()));
+                            } catch (...) {
+                                LOG_E("Main", "Old scheduler recovery failed with an unknown exception");
+                            }
+                            if (!old_cgroups_ready) {
+                                LOG_E("Main", "Failed to restore old cgroup configuration; stopping scheduler");
+                                running.store(false, std::memory_order_release);
+                            } else if (!old_workers_started) {
+                                LOG_E("Main", "Old scheduler could not be fully restarted; stopping scheduler");
+                                running.store(false, std::memory_order_release);
+                            }
+                            full_rescan_needed.store(true, std::memory_order_release);
+                            next_full_scan = std::chrono::steady_clock::now();
                         } else {
-                            // Build every replacement object before stopping the active scheduler.
-                            auto new_matcher = std::make_shared<ThreadMatcher>(new_config);
-                            auto new_cpuset = std::make_shared<CpusetSetter>(
-                                *new_matcher, new_config.sched.timing);
-                            auto new_prio = std::make_shared<PrioritySetter>(*new_matcher);
-                            auto new_cpuctl = std::make_shared<CpuctlSetter>();
-                            std::vector<std::unique_ptr<ScanWorker>> new_workers;
-                            for (int index = 1; index <= 4; ++index) {
-                                auto worker = std::make_unique<ScanWorker>(
-                                    "ScanWorker" + std::to_string(index), new_config.sched.timing);
-                                worker->set_configs(new_matcher, new_cpuset, new_prio, new_cpuctl, cache_ptr);
-                                new_workers.push_back(std::move(worker));
-                            }
-
-                            std::lock_guard<std::mutex> scheduler_lock(scheduler_state_mutex);
-                            Config old_config = config;
-                            auto old_matcher = matcher_ptr;
-                            auto old_cpuset = cpuset_ptr;
-                            auto old_prio = prio_ptr;
-                            auto old_cpuctl = cpuctl_ptr;
-                            auto old_workers = std::move(workers);
-
-                            for (auto& worker : old_workers) {
-                                worker->stop();
-                            }
-                            restore_all_thread_baselines(*cache_ptr, *old_cpuset, *old_prio, *old_cpuctl);
-
+                            workers = std::move(new_workers);
                             config = std::move(new_config);
                             matcher_ptr = std::move(new_matcher);
                             cpuset_ptr = std::move(new_cpuset);
                             prio_ptr = std::move(new_prio);
                             cpuctl_ptr = std::move(new_cpuctl);
-                            workers = std::move(new_workers);
+                            cache_ptr->clear_scheduling_state_preserving_baselines();
+                            pinned_cache->clear();
+                            topfore_cache->clear();
+                            cached_top_app_pids.clear();
+                            cached_foreground_pids.clear();
+                            cached_background_pids.clear();
+                            cached_process_states.clear();
+                            top_cursor = {};
+                            pinned_cursor = {};
+                            topfore_cursor = {};
+                            foreground_cursor = {};
+                            background_cursor = {};
+                            full_scan_phase = 0;
+                            full_cycle_active = false;
+                            full_scan_state.reset();
+                            full_cycle_processed_tids.clear();
+                            highspeed_ms = std::max(config.sched.highspeed_sched_ms, 1);
+                            refresh_ms = std::max(config.sched.refresh_interval_ms, highspeed_ms);
+                            next_full_scan = std::chrono::steady_clock::now();
+                            FileUtils::set_cache_ttls(config.sched.timing.file_cache_ttl_ms,
+                                                      config.sched.timing.cgroup_cache_ttl_ms);
+                            g_event_router->set_throttle_ms(
+                                config.sched.timing.event_throttle_ms);
+                            config_retry_delay_seconds =
+                                config.sched.timing.config_retry_initial_delay_s;
 
-                            bool workers_started = true;
-                            for (auto& worker : workers) {
-                                if (!worker->start()) {
-                                    workers_started = false;
-                                    break;
-                                }
+                            std::string new_log_path = config.sched.log.output;
+                            if (new_log_path.empty() || new_log_path == "stdout"
+                                || new_log_path == "stderr") {
+                                new_log_path = "/data/adb/ReUperf/ReUperf.log";
                             }
-                            if (!workers_started) {
-                                LOG_E("Main", "Failed to start replacement workers; restoring old scheduler");
-                                for (auto& worker : workers) {
-                                    worker->stop();
-                                }
-                                workers = std::move(old_workers);
-                                config = std::move(old_config);
-                                matcher_ptr = std::move(old_matcher);
-                                cpuset_ptr = std::move(old_cpuset);
-                                prio_ptr = std::move(old_prio);
-                                cpuctl_ptr = std::move(old_cpuctl);
-                                for (auto& worker : workers) {
-                                    worker->set_configs(matcher_ptr, cpuset_ptr, prio_ptr, cpuctl_ptr, cache_ptr);
-                                    if (!worker->start()) {
-                                        LOG_E("Main", "Failed to restart old worker after reload rollback");
-                                    }
-                                }
-                                full_rescan_needed.store(true, std::memory_order_release);
-                                next_full_scan = std::chrono::steady_clock::now();
-                            } else {
-                                cache_ptr->clear_scheduling_state_preserving_baselines();
-                                pinned_cache->clear();
-                                topfore_cache->clear();
-                                cached_top_app_pids.clear();
-                                cached_foreground_pids.clear();
-                                cached_background_pids.clear();
-                                top_cursor = {};
-                                pinned_cursor = {};
-                                topfore_cursor = {};
-                                foreground_cursor = {};
-                                background_cursor = {};
-                                full_scan_phase = 0;
-                                full_cycle_active = false;
-                                full_scan_state.reset();
-                                full_cycle_processed_tids.clear();
-                                highspeed_ms = std::max(config.sched.highspeed_sched_ms, 1);
-                                refresh_ms = std::max(config.sched.refresh_interval_ms, highspeed_ms);
-                                next_full_scan = std::chrono::steady_clock::now();
-                                FileUtils::set_cache_ttls(config.sched.timing.file_cache_ttl_ms,
-                                                          config.sched.timing.cgroup_cache_ttl_ms);
-                                g_event_router->set_throttle_ms(
-                                    config.sched.timing.event_throttle_ms);
-                                config_retry_delay_seconds =
-                                    config.sched.timing.config_retry_initial_delay_s;
-
-                                std::string new_log_path = config.sched.log.output;
-                                if (new_log_path.empty() || new_log_path == "stdout" || new_log_path == "stderr") {
-                                    new_log_path = "/data/adb/ReUperf/ReUperf.log";
-                                }
-                                Logger::instance().init(parse_log_level(config.sched.log.level), new_log_path, true);
-                                LOG_I("Main", "Config reloaded - top=" + std::to_string(highspeed_ms)
-                                      + "ms, full=" + std::to_string(refresh_ms) + "ms");
-                                reload_succeeded = true;
-                            }
+                            Logger::instance().init(parse_log_level(config.sched.log.level),
+                                                    new_log_path, true);
+                            LOG_I("Main", "Config reloaded - top="
+                                  + std::to_string(highspeed_ms)
+                                  + "ms, full=" + std::to_string(refresh_ms) + "ms");
+                            reload_succeeded = true;
                         }
                     }
                 }
@@ -1126,7 +1235,7 @@ int main(int argc, char* argv[]) {
                 topfore_cursor = {};
                 foreground_cursor = {};
                 background_cursor = {};
-                full_scan_state.begin(*cache_ptr);
+                full_scan_state.begin(*cache_ptr, cached_process_states);
                 full_cycle_processed_tids.clear();
             }
 
@@ -1139,6 +1248,7 @@ int main(int argc, char* argv[]) {
                     cached_top_app_pids = full_scan_state.top_app_pids;
                     cached_foreground_pids = full_scan_state.foreground_pids;
                     cached_background_pids = full_scan_state.background_pids;
+                    cached_process_states = full_scan_state.observed_states;
                     cleanup_dead_pids(*cache_ptr, *pinned_cache, *topfore_cache,
                                       full_scan_state.dead_pids, full_scan_state.pinned_pids,
                                       full_scan_state.topfore_pids);
@@ -1213,9 +1323,7 @@ int main(int argc, char* argv[]) {
     monitor.stop();
     g_event_router->stop();
     
-    for (auto& w : workers) {
-        w->stop();
-    }
+    stop_all_workers(workers, "Stopping workers for shutdown");
     restore_all_thread_baselines(*cache_ptr, *cpuset_ptr, *prio_ptr, *cpuctl_ptr);
     cache_ptr->clear();
     
