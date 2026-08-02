@@ -15,6 +15,8 @@
 #include "core/cgroup_init.hpp"
 #include "core/event_router.hpp"
 #include "core/restoration_retry.hpp"
+#include "core/scan_worker.hpp"
+#include "core/scan_cursor.hpp"
 #include "core/thread_cache.hpp"
 #include "core/thread_matcher.hpp"
 #include "scheduler/cpuset_setter.hpp"
@@ -557,6 +559,64 @@ void test_affinity_takeover_stops_on_identity_change() {
             "takeover continued mutating a recycled TID");
 }
 
+
+void test_scan_cursor_lifecycle() {
+    ScanCursor cursor;
+    cursor.begin_pid(static_cast<int>(getpid()));
+    ScanBudget budget(1'000'000, 32, 0);
+    require(cursor.enumerate_tids(budget),
+            "scan cursor failed to enumerate the current process");
+    require(std::find(cursor.tids.begin(), cursor.tids.end(), static_cast<int>(getpid()))
+                != cursor.tids.end(),
+            "scan cursor omitted the current process leader");
+    require(cursor.task_dir == nullptr && cursor.tid_enumeration_complete,
+            "scan cursor retained a directory after enumeration completed");
+
+    cursor.process_name_loaded = true;
+    cursor.process_name = "cached";
+    cursor.process_start_time_loaded = true;
+    cursor.process_start_time = 42;
+    cursor.cmdline_loaded = true;
+    cursor.cmdline = "cached";
+    cursor.reset();
+    require(cursor.pid == 0 && cursor.task_dir == nullptr && cursor.tids.empty()
+                && cursor.tid_index == 0 && !cursor.process_name_loaded
+                && !cursor.process_start_time_loaded && !cursor.cmdline_loaded,
+            "scan cursor reset left resumable state behind");
+
+    cursor.begin_pid(static_cast<int>(getpid()));
+    ScanBudget exhausted_budget(0, 32, 0);
+    require(!cursor.enumerate_tids(exhausted_budget),
+            "exhausted scan budget unexpectedly completed enumeration");
+    require(cursor.task_dir != nullptr,
+            "scan cursor did not preserve its directory for budgeted continuation");
+    cursor.reset();
+    require(cursor.task_dir == nullptr,
+            "scan cursor reset leaked its resumable directory");
+}
+
+void test_scan_cadence_policy() {
+    require(should_throttle_same_state_schedule(true, 199, 200),
+            "same-state TOP scheduling was not throttled within the configured interval");
+    require(!should_throttle_same_state_schedule(true, 200, 200),
+            "same-state scheduling was throttled after the configured interval");
+    require(!should_throttle_same_state_schedule(false, 0, 200),
+            "state transition was incorrectly throttled");
+    require(!should_throttle_same_state_schedule(true, 0, 0),
+            "zero scheduling interval did not disable throttling");
+
+    require(!should_run_managed_cgroup_check(true, false, false),
+            "cpuset cgroup check bypassed its configured cadence");
+    require(!should_run_managed_cgroup_check(false, true, false),
+            "cpuctl cgroup check bypassed its configured cadence");
+    require(should_run_managed_cgroup_check(true, false, true),
+            "due cpuset cgroup check was suppressed");
+    require(should_run_managed_cgroup_check(false, true, true),
+            "due cpuctl cgroup check was suppressed");
+    require(!should_run_managed_cgroup_check(false, false, true),
+            "unmanaged task requested a cgroup drift check");
+}
+
 void test_match_result_equality() {
     MatchResult left;
     left.matched = true;
@@ -631,6 +691,8 @@ int main() {
     test_affinity_takeover_stops_on_identity_change();
     test_restoration_retry();
     test_controller_requirements();
+    test_scan_cursor_lifecycle();
+    test_scan_cadence_policy();
     test_match_result_equality();
     test_priority_policy_mapping();
     test_event_router_throttle();

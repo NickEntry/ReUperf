@@ -25,6 +25,16 @@
 #include "../scheduler/priority_setter.hpp"
 #include "../scheduler/cpuctl_setter.hpp"
 
+inline bool should_throttle_same_state_schedule(bool same_state, int64_t elapsed_ms,
+                                                int min_interval_ms) {
+    return same_state && elapsed_ms < min_interval_ms;
+}
+
+inline bool should_run_managed_cgroup_check(bool manages_cpuset, bool manages_cpuctl,
+                                            bool cadence_due) {
+    return (manages_cpuset || manages_cpuctl) && cadence_due;
+}
+
 struct DispatchTask {
     int pid;
     int tid;
@@ -229,11 +239,11 @@ private:
         const auto state_it = last_schedule_state_.find(key);
         const bool same_state = state_it != last_schedule_state_.end()
             && state_it->second == task.state;
-        if (task.state != ProcessState::TOP && same_state
-            && time_it != last_schedule_time_.end()) {
+        if (time_it != last_schedule_time_.end()) {
             const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - time_it->second).count();
-            if (elapsed < timing_.min_schedule_interval_ms) {
+            if (should_throttle_same_state_schedule(
+                    same_state, elapsed, timing_.min_schedule_interval_ms)) {
                 return true;
             }
         }
@@ -275,10 +285,8 @@ private:
         const bool check_cpuset = !result.affinity_class.empty()
             && result.affinity_class != "auto" && !result.cpumask_name.empty();
         const bool check_cpuctl = result.enable_limit && result.thread_rule_index >= 0;
-        const bool aggressive_check = result.effective_state == ProcessState::TOP
-            || result.pinned || result.topfore;
-        if ((!check_cpuset && !check_cpuctl)
-            || (!aggressive_check && !should_check_cgroup(task))) {
+        const bool cadence_due = (check_cpuset || check_cpuctl) && should_check_cgroup(task);
+        if (!should_run_managed_cgroup_check(check_cpuset, check_cpuctl, cadence_due)) {
             return false;
         }
 
@@ -366,72 +374,101 @@ private:
             baseline.cpuctl_path = "/dev/cpuctl" + cgroups.cpuctl;
             baseline.has_cpuctl_path = true;
         }
-        cache.set_baseline(task.pid, task.tid, std::move(baseline));
+        if (is_current_task_identity(task)) {
+            cache.set_baseline(task.pid, task.tid, std::move(baseline));
+        }
     }
 
-    bool restore_affinity_baseline(int tid, const ThreadBaseline& baseline,
+    bool restore_affinity_baseline(const DispatchTask& task, const ThreadBaseline& baseline,
                                    CpusetSetter& cpuset) {
         bool restored = true;
-        if (baseline.has_cpuset_path
-            && !cpuset.restore_cpuset_cgroup(tid, baseline.cpuset_path)) {
-            LOG_W("ScanWorker", name_ + " failed to restore cpuset cgroup for tid "
-                  + std::to_string(tid));
-            restored = false;
+        if (baseline.has_cpuset_path) {
+            if (!is_current_task_identity(task)) return false;
+            if (!cpuset.restore_cpuset_cgroup(task.tid, baseline.cpuset_path)) {
+                LOG_W("ScanWorker", name_ + " failed to restore cpuset cgroup for tid "
+                      + std::to_string(task.tid));
+                restored = false;
+            }
         }
-        if (baseline.has_affinity && !cpuset.restore_affinity(tid, baseline.affinity)) {
-            LOG_W("ScanWorker", name_ + " failed to restore affinity for tid "
-                  + std::to_string(tid));
-            restored = false;
+        if (baseline.has_affinity) {
+            if (!is_current_task_identity(task)) return false;
+            if (!cpuset.restore_affinity(task.tid, baseline.affinity)) {
+                LOG_W("ScanWorker", name_ + " failed to restore affinity for tid "
+                      + std::to_string(task.tid));
+                restored = false;
+            }
         }
-        return restored;
+        return restored && is_current_task_identity(task);
     }
 
-    bool restore_scheduler_baseline(int tid, const ThreadBaseline& baseline,
+    bool restore_scheduler_baseline(const DispatchTask& task, const ThreadBaseline& baseline,
                                     PrioritySetter& prio) {
+        if (!is_current_task_identity(task)) return false;
         if (!baseline.has_scheduler || !prio.restore_scheduler(
-                tid, baseline.scheduler_policy, baseline.scheduler_priority, baseline.nice)) {
+                task.tid, baseline.scheduler_policy, baseline.scheduler_priority, baseline.nice)) {
             LOG_W("ScanWorker", name_ + " failed to restore scheduler for tid "
-                  + std::to_string(tid));
+                  + std::to_string(task.tid));
             return false;
         }
-        return true;
+        return is_current_task_identity(task);
     }
 
-    bool restore_cpuctl_baseline(int tid, const ThreadBaseline& baseline,
+    bool restore_cpuctl_baseline(const DispatchTask& task, const ThreadBaseline& baseline,
                                  CpuctlSetter& cpuctl) {
+        if (!is_current_task_identity(task)) return false;
         if (!baseline.has_cpuctl_path
-            || !cpuctl.restore_cpuctl_cgroup(tid, baseline.cpuctl_path)) {
+            || !cpuctl.restore_cpuctl_cgroup(task.tid, baseline.cpuctl_path)) {
             LOG_W("ScanWorker", name_ + " failed to restore cpuctl cgroup for tid "
-                  + std::to_string(tid));
+                  + std::to_string(task.tid));
             return false;
         }
-        return true;
+        return is_current_task_identity(task);
     }
 
-    void restore_baseline(int pid, int tid, ThreadCache& cache, CpusetSetter& cpuset,
+    void restore_baseline(const DispatchTask& task, ThreadCache& cache, CpusetSetter& cpuset,
                           PrioritySetter& prio, CpuctlSetter& cpuctl) {
-        const auto baseline = cache.get_baseline(pid, tid);
+        const auto baseline = cache.get_baseline(task.pid, task.tid);
         if (!baseline) {
-            cache.clear_applied_result(pid, tid);
-            cache.clear_managed_components(pid, tid);
+            cache.clear_applied_result(task.pid, task.tid);
+            cache.clear_managed_components(task.pid, task.tid);
+            return;
+        }
+        if (!is_current_task_identity(task)) {
+            cache.erase_thread_if_identity(task.pid, task.tid, task.process_start_time,
+                                           task.thread_start_time);
             return;
         }
 
         bool restored = true;
-        // Reverse the apply order: cpuctl, scheduler, cpuset cgroup, then affinity.
-        if (baseline->has_cpuctl_path && !restore_cpuctl_baseline(tid, *baseline, cpuctl)) {
+        // Reverse the apply order and revalidate identity around every state change.
+        if (baseline->has_cpuctl_path && !restore_cpuctl_baseline(task, *baseline, cpuctl)) {
             restored = false;
         }
-        if (baseline->has_scheduler && !restore_scheduler_baseline(tid, *baseline, prio)) {
+        if (!is_current_task_identity(task)) {
+            cache.erase_thread_if_identity(task.pid, task.tid, task.process_start_time,
+                                           task.thread_start_time);
+            return;
+        }
+        if (baseline->has_scheduler && !restore_scheduler_baseline(task, *baseline, prio)) {
             restored = false;
         }
-        if (!restore_affinity_baseline(tid, *baseline, cpuset)) {
+        if (!is_current_task_identity(task)) {
+            cache.erase_thread_if_identity(task.pid, task.tid, task.process_start_time,
+                                           task.thread_start_time);
+            return;
+        }
+        if (!restore_affinity_baseline(task, *baseline, cpuset)) {
             restored = false;
+        }
+        if (!is_current_task_identity(task)) {
+            cache.erase_thread_if_identity(task.pid, task.tid, task.process_start_time,
+                                           task.thread_start_time);
+            return;
         }
         if (restored) {
-            cache.clear_baseline(pid, tid);
-            cache.clear_applied_result(pid, tid);
-            cache.clear_managed_components(pid, tid);
+            cache.clear_baseline(task.pid, task.tid);
+            cache.clear_applied_result(task.pid, task.tid);
+            cache.clear_managed_components(task.pid, task.tid);
         }
     }
 
@@ -439,7 +476,7 @@ private:
                       const std::string& cpuset_base, ThreadMatcher& matcher, ThreadCache& cache,
                       CpusetSetter& cpuset, PrioritySetter& prio, CpuctlSetter& cpuctl) {
         if (!needs_managed_state(result, matcher)) {
-            restore_baseline(task.pid, task.tid, cache, cpuset, prio, cpuctl);
+            restore_baseline(task, cache, cpuset, prio, cpuctl);
             return;
         }
         capture_baseline_if_needed(task, cache, prio);
@@ -456,7 +493,7 @@ private:
 
         ManagedComponents managed = cache.get_managed_components(task.pid, task.tid);
         if (should_restore_managed_component(managed.affinity, needs_affinity)) {
-            if (!restore_affinity_baseline(task.tid, *baseline, cpuset)) {
+            if (!restore_affinity_baseline(task, *baseline, cpuset)) {
                 LOG_W("ScanWorker", name_ + " skipped scheduling for tid "
                       + std::to_string(task.tid)
                       + " because its affinity baseline could not be restored");
@@ -466,7 +503,7 @@ private:
             cache.set_managed_components(task.pid, task.tid, managed);
         }
         if (should_restore_managed_component(managed.priority, needs_priority)) {
-            if (!restore_scheduler_baseline(task.tid, *baseline, prio)) {
+            if (!restore_scheduler_baseline(task, *baseline, prio)) {
                 LOG_W("ScanWorker", name_ + " skipped scheduling for tid "
                       + std::to_string(task.tid)
                       + " because its scheduler baseline could not be restored");
@@ -476,7 +513,7 @@ private:
             cache.set_managed_components(task.pid, task.tid, managed);
         }
         if (should_restore_managed_component(managed.cpuctl, result.enable_limit)) {
-            if (!restore_cpuctl_baseline(task.tid, *baseline, cpuctl)) {
+            if (!restore_cpuctl_baseline(task, *baseline, cpuctl)) {
                 LOG_W("ScanWorker", name_ + " skipped scheduling for tid "
                       + std::to_string(task.tid)
                       + " because its cpuctl baseline could not be restored");

@@ -38,6 +38,7 @@
 #include "core/thread_cache.hpp"
 #include "core/scan_worker.hpp"
 #include "core/restoration_retry.hpp"
+#include "core/scan_cursor.hpp"
 #include "scheduler/cpuset_setter.hpp"
 #include "scheduler/priority_setter.hpp"
 #include "scheduler/cpuctl_setter.hpp"
@@ -253,35 +254,6 @@ private:
 
 using PinnedCache = PidCache;
 using TopForeCache = PidCache;
-
-struct ScanBudget {
-    explicit ScanBudget(int budget_us, int configured_batch_size,
-                        int configured_batch_yield_us)
-        : deadline(std::chrono::steady_clock::now() + std::chrono::microseconds(budget_us)),
-          batch_size(std::max(configured_batch_size, 1)),
-          batch_yield_us(std::max(configured_batch_yield_us, 0)) {}
-
-    bool exhausted() const {
-        return std::chrono::steady_clock::now() >= deadline;
-    }
-
-    void after_thread_read() {
-        ++thread_reads;
-        if (batch_yield_us > 0 && thread_reads % static_cast<size_t>(batch_size) == 0) {
-            std::this_thread::sleep_for(std::chrono::microseconds(batch_yield_us));
-        }
-    }
-
-    std::chrono::steady_clock::time_point deadline;
-    int batch_size;
-    int batch_yield_us;
-    size_t thread_reads = 0;
-};
-
-struct ScanCursor {
-    int pid = 0;
-    int tid = 0;
-};
 
 struct FullScanState {
     bool active = false;
@@ -574,75 +546,105 @@ inline bool dispatch_pids_to_workers(
     const std::set<int>& pids, ProcessState state, const std::string& cpuset_base,
     std::set<int>& processed_tids, ScanBudget& budget, ScanCursor& cursor) {
     if (workers.empty() || pids.empty()) {
+        cursor.reset();
         return false;
     }
 
     auto pid_it = cursor.pid > 0 ? pids.lower_bound(cursor.pid) : pids.begin();
     if (pid_it == pids.end()) {
-        cursor = {0, 0};
+        cursor.reset();
         return false;
+    }
+    if (cursor.pid > 0 && *pid_it != cursor.pid) {
+        cursor.reset();
     }
 
     while (pid_it != pids.end()) {
         const int pid = *pid_it;
-        const std::string proc_name = FileUtils::get_process_name_from_status(pid);
-        if (proc_name != "[dead]") {
-            const uint64_t process_start_time = FileUtils::get_process_start_time(pid);
-            if (process_start_time == 0) {
-                cursor = {pid, 0};
-                ++pid_it;
-                continue;
-            }
-            const std::string cmdline = FileUtils::get_process_cmdline(pid);
-            const auto tids = FileUtils::list_tids(pid);
-            const int resume_after_tid = cursor.pid == pid ? cursor.tid : 0;
-            for (int tid : tids) {
-                if (tid <= resume_after_tid || processed_tids.count(tid) > 0) {
-                    continue;
-                }
-                if (budget.exhausted()) {
-                    cursor = {pid, tid - 1};
-                    return true;
-                }
+        if (cursor.pid != pid) {
+            cursor.begin_pid(pid);
+        }
+        if (!cursor.enumerate_tids(budget)) {
+            return true;
+        }
+        if (budget.exhausted()) {
+            return true;
+        }
 
-                // Do not pre-stat the thread path: opendir/open is authoritative and avoids
-                // an extra syscall plus a TOCTOU race when a thread exits concurrently.
-                const std::string thread_name = FileUtils::get_thread_name(pid, tid);
+        if (!cursor.process_name_loaded) {
+            cursor.process_name = FileUtils::get_process_name_from_status(pid);
+            cursor.process_name_loaded = true;
+            budget.after_thread_read();
+        }
+        if (cursor.process_name != "[dead]") {
+            if (budget.exhausted()) return true;
+            if (!cursor.process_start_time_loaded) {
+                cursor.process_start_time = FileUtils::get_process_start_time(pid);
+                cursor.process_start_time_loaded = true;
                 budget.after_thread_read();
-                if (thread_name == "[dead]") {
-                    continue;
+            }
+            if (cursor.process_start_time != 0) {
+                if (budget.exhausted()) return true;
+                if (!cursor.cmdline_loaded) {
+                    cursor.cmdline = FileUtils::get_process_cmdline(pid);
+                    cursor.cmdline_loaded = true;
+                    budget.after_thread_read();
                 }
+                while (cursor.tid_index < cursor.tids.size()) {
+                    if (budget.exhausted()) return true;
+                    const int tid = cursor.tids[cursor.tid_index++];
+                    if (processed_tids.count(tid) > 0) continue;
 
-                const uint64_t thread_start_time = FileUtils::get_thread_start_time(pid, tid);
-                if (thread_start_time == 0) {
-                    continue;
+                    const std::string thread_name = FileUtils::get_thread_name(pid, tid);
+                    budget.after_thread_read();
+                    if (thread_name == "[dead]") continue;
+                    if (budget.exhausted()) {
+                        --cursor.tid_index;
+                        return true;
+                    }
+
+                    const uint64_t thread_start_time = FileUtils::get_thread_start_time(pid, tid);
+                    budget.after_thread_read();
+                    if (thread_start_time == 0) continue;
+                    const uint64_t verified_process_start_time =
+                        FileUtils::get_process_start_time(pid);
+                    budget.after_thread_read();
+                    if (verified_process_start_time != cursor.process_start_time) {
+                        cursor.reset();
+                        full_rescan_needed.store(true, std::memory_order_release);
+                        return true;
+                    }
+                    if (budget.exhausted()) {
+                        --cursor.tid_index;
+                        return true;
+                    }
+                    DispatchTask task{pid, tid, cursor.process_start_time, thread_start_time,
+                                      thread_name, state, cpuset_base, cursor.process_name,
+                                      cursor.cmdline};
+                    size_t worker_hash = std::hash<int>{}(pid);
+                    worker_hash ^= std::hash<int>{}(tid) + 0x9e3779b9U
+                        + (worker_hash << 6) + (worker_hash >> 2);
+                    worker_hash ^= std::hash<uint64_t>{}(cursor.process_start_time) + 0x9e3779b9U
+                        + (worker_hash << 6) + (worker_hash >> 2);
+                    worker_hash ^= std::hash<uint64_t>{}(thread_start_time) + 0x9e3779b9U
+                        + (worker_hash << 6) + (worker_hash >> 2);
+                    const size_t worker_idx = worker_hash % workers.size();
+                    const ScanWorker::EnqueueResult enqueue_result = workers[worker_idx]->enqueue(task);
+                    if (enqueue_result == ScanWorker::EnqueueResult::QueueFull
+                        || enqueue_result == ScanWorker::EnqueueResult::Stopped) {
+                        --cursor.tid_index;
+                        full_rescan_needed.store(true, std::memory_order_release);
+                        return true;
+                    }
+                    processed_tids.insert(tid);
                 }
-                DispatchTask task{pid, tid, process_start_time, thread_start_time, thread_name,
-                                  state, cpuset_base, proc_name, cmdline};
-                size_t worker_hash = std::hash<int>{}(pid);
-                worker_hash ^= std::hash<int>{}(tid) + 0x9e3779b9U
-                    + (worker_hash << 6) + (worker_hash >> 2);
-                worker_hash ^= std::hash<uint64_t>{}(process_start_time) + 0x9e3779b9U
-                    + (worker_hash << 6) + (worker_hash >> 2);
-                worker_hash ^= std::hash<uint64_t>{}(thread_start_time) + 0x9e3779b9U
-                    + (worker_hash << 6) + (worker_hash >> 2);
-                const size_t worker_idx = worker_hash % workers.size();
-                const ScanWorker::EnqueueResult enqueue_result = workers[worker_idx]->enqueue(task);
-                if (enqueue_result == ScanWorker::EnqueueResult::QueueFull
-                    || enqueue_result == ScanWorker::EnqueueResult::Stopped) {
-                    full_rescan_needed.store(true, std::memory_order_release);
-                    cursor = {pid, tid - 1};
-                    return true;
-                }
-                processed_tids.insert(tid);
             }
         }
 
-        cursor = {pid, 0};
+        cursor.reset();
         ++pid_it;
     }
 
-    cursor = {0, 0};
     return false;
 }
 
@@ -705,33 +707,64 @@ bool restore_all_thread_baselines(ThreadCache& cache, CpusetSetter& cpuset,
         const int pid = entry.pid;
         const int tid = entry.tid;
         const ThreadBaseline& baseline = entry.baseline;
-        if (FileUtils::get_process_start_time(pid) != entry.process_start_time
-            || FileUtils::get_thread_start_time(pid, tid) != entry.thread_start_time
-            || !FileUtils::is_thread_in_process(pid, tid)) {
+        const auto identity_matches = [&]() {
+            return FileUtils::get_process_start_time(pid) == entry.process_start_time
+                && FileUtils::get_thread_start_time(pid, tid) == entry.thread_start_time
+                && FileUtils::is_thread_in_process(pid, tid);
+        };
+        const auto discard_stale_identity = [&]() {
             LOG_D("Main", "Discarding baseline for stale pid/tid identity: "
                   + std::to_string(pid) + "/" + std::to_string(tid));
             cache.erase_thread_if_identity(pid, tid, entry.process_start_time,
                                            entry.thread_start_time);
+        };
+        if (!identity_matches()) {
+            discard_stale_identity();
             continue;
         }
 
         bool restored = true;
-        if (baseline.has_cpuctl_path && !cpuctl.restore_cpuctl_cgroup(tid, baseline.cpuctl_path)) {
-            LOG_W("Main", "Failed to restore cpuctl cgroup for tid " + std::to_string(tid));
-            restored = false;
+        if (baseline.has_cpuctl_path) {
+            if (!identity_matches()) {
+                discard_stale_identity();
+                continue;
+            }
+            if (!cpuctl.restore_cpuctl_cgroup(tid, baseline.cpuctl_path)) {
+                LOG_W("Main", "Failed to restore cpuctl cgroup for tid " + std::to_string(tid));
+                restored = false;
+            }
         }
-        if (baseline.has_scheduler && !prio.restore_scheduler(
-                tid, baseline.scheduler_policy, baseline.scheduler_priority, baseline.nice)) {
-            LOG_W("Main", "Failed to restore scheduler for tid " + std::to_string(tid));
-            restored = false;
+        if (!identity_matches()) {
+            discard_stale_identity();
+            continue;
         }
-        if (baseline.has_cpuset_path && !cpuset.restore_cpuset_cgroup(tid, baseline.cpuset_path)) {
+        if (baseline.has_scheduler) {
+            if (!prio.restore_scheduler(
+                    tid, baseline.scheduler_policy, baseline.scheduler_priority, baseline.nice)) {
+                LOG_W("Main", "Failed to restore scheduler for tid " + std::to_string(tid));
+                restored = false;
+            }
+        }
+        if (!identity_matches()) {
+            discard_stale_identity();
+            continue;
+        }
+        if (baseline.has_cpuset_path
+            && !cpuset.restore_cpuset_cgroup(tid, baseline.cpuset_path)) {
             LOG_W("Main", "Failed to restore cpuset cgroup for tid " + std::to_string(tid));
             restored = false;
+        }
+        if (!identity_matches()) {
+            discard_stale_identity();
+            continue;
         }
         if (baseline.has_affinity && !cpuset.restore_affinity(tid, baseline.affinity)) {
             LOG_W("Main", "Failed to restore affinity for tid " + std::to_string(tid));
             restored = false;
+        }
+        if (!identity_matches()) {
+            discard_stale_identity();
+            continue;
         }
         if (restored) {
             cache.clear_baseline(pid, tid);
@@ -1160,11 +1193,11 @@ int main(int argc, char* argv[]) {
                             cached_foreground_pids.clear();
                             cached_background_pids.clear();
                             cached_process_states.clear();
-                            top_cursor = {};
-                            pinned_cursor = {};
-                            topfore_cursor = {};
-                            foreground_cursor = {};
-                            background_cursor = {};
+                            top_cursor.reset();
+                            pinned_cursor.reset();
+                            topfore_cursor.reset();
+                            foreground_cursor.reset();
+                            background_cursor.reset();
                             full_scan_phase = 0;
                             full_cycle_active = false;
                             full_scan_state.reset();
@@ -1236,11 +1269,11 @@ int main(int argc, char* argv[]) {
             if (!full_cycle_active) {
                 full_cycle_active = true;
                 full_scan_phase = 0;
-                top_cursor = {};
-                pinned_cursor = {};
-                topfore_cursor = {};
-                foreground_cursor = {};
-                background_cursor = {};
+                top_cursor.reset();
+                pinned_cursor.reset();
+                topfore_cursor.reset();
+                foreground_cursor.reset();
+                background_cursor.reset();
                 full_scan_state.begin(*cache_ptr, cached_process_states);
                 full_cycle_processed_tids.clear();
             }

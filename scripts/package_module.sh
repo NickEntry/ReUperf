@@ -90,11 +90,49 @@ if [ -z "$READELF" ]; then
     exit 1
 fi
 
+elf_machine() {
+    "$READELF" -h "$1" 2>/dev/null | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p'
+}
+
+validate_android_shared_library() {
+    local library="$1"
+    local header
+    header="$("$READELF" -h "$library" 2>/dev/null)" || return 1
+    local machine
+    machine="$(printf '%s\n' "$header" | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')"
+    if [ "$machine" != "$EXPECTED_MACHINE" ]; then
+        echo "ERROR: libc++_shared.so architecture mismatch: expected $EXPECTED_MACHINE, got $machine"
+        return 1
+    fi
+    if ! printf '%s\n' "$header" | grep -Eq '^[[:space:]]*Type:[[:space:]]*DYN([[:space:]]|$)'; then
+        echo "ERROR: libc++_shared.so is not an ELF shared object: $library"
+        return 1
+    fi
+    if ! "$READELF" -W -S "$library" 2>/dev/null | grep -Fq '.note.android.ident'; then
+        echo "ERROR: libc++_shared.so lacks the Android NDK identification note: $library"
+        return 1
+    fi
+    local dynamic
+    dynamic="$("$READELF" -d "$library" 2>/dev/null || true)"
+    if printf '%s\n' "$dynamic" | grep -Eq 'Shared library: \[(libc\.so\.6|libstdc\+\+\.so\.6|libgcc_s\.so\.1)\]'; then
+        echo "ERROR: libc++_shared.so depends on host GNU runtime libraries: $library"
+        return 1
+    fi
+}
+
+find_ndk_libcxx() {
+    local ndk_root="$1"
+    [ -d "$ndk_root/toolchains/llvm/prebuilt" ] || return 1
+    find "$ndk_root/toolchains/llvm/prebuilt" \
+        -path "*/sysroot/usr/lib/$TARGET_TRIPLE/libc++_shared.so" \
+        -type f -print -quit 2>/dev/null
+}
+
 ELF_HEADER="$($READELF -h "$BINARY" 2>/dev/null)" || {
     echo "ERROR: Binary is not a readable ELF file: $BINARY"
     exit 1
 }
-ACTUAL_MACHINE="$(printf '%s\n' "$ELF_HEADER" | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')"
+ACTUAL_MACHINE="$(elf_machine "$BINARY")"
 if [ "$ACTUAL_MACHINE" != "$EXPECTED_MACHINE" ]; then
     echo "ERROR: Binary architecture mismatch: expected $EXPECTED_MACHINE for $ARCH, got $ACTUAL_MACHINE"
     exit 1
@@ -171,41 +209,21 @@ chmod 0755 "$STAGING_DIR/ReUperf/thread_scheduler"
 if [ "$BUILD_TYPE" = "dynamic" ]; then
     echo "[3/6] Resolving libc++_shared.so..."
 
-    # 优先从 NDK 获取
+    # Resolve the NDK host prebuilt directory dynamically (Linux/macOS/x86_64/arm64).
     LIBCXX_SOURCE=""
     if [ -n "$NDK_PATH" ] && [ -d "$NDK_PATH" ]; then
-        NDK_LIBCXX="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$TARGET_TRIPLE/libc++_shared.so"
-        if [ -f "$NDK_LIBCXX" ]; then
-            LIBCXX_SOURCE="$NDK_LIBCXX"
-            echo "  → Found in NDK: $NDK_LIBCXX"
-        fi
+        LIBCXX_SOURCE="$(find_ndk_libcxx "$NDK_PATH" || true)"
+        [ -z "$LIBCXX_SOURCE" ] || echo "  → Found in NDK: $LIBCXX_SOURCE"
     fi
 
-    # 备选：从 ANDROID_NDK_HOME 环境变量
     if [ -z "$LIBCXX_SOURCE" ] && [ -n "${ANDROID_NDK_HOME:-}" ]; then
-        NDK_LIBCXX="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$TARGET_TRIPLE/libc++_shared.so"
-        if [ -f "$NDK_LIBCXX" ]; then
-            LIBCXX_SOURCE="$NDK_LIBCXX"
-            echo "  → Found in ANDROID_NDK_HOME: $NDK_LIBCXX"
-        fi
+        LIBCXX_SOURCE="$(find_ndk_libcxx "$ANDROID_NDK_HOME" || true)"
+        [ -z "$LIBCXX_SOURCE" ] || echo "  → Found in ANDROID_NDK_HOME: $LIBCXX_SOURCE"
     fi
 
-    # 备选：从 ANDROID_NDK 环境变量
     if [ -z "$LIBCXX_SOURCE" ] && [ -n "${ANDROID_NDK:-}" ]; then
-        NDK_LIBCXX="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$TARGET_TRIPLE/libc++_shared.so"
-        if [ -f "$NDK_LIBCXX" ]; then
-            LIBCXX_SOURCE="$NDK_LIBCXX"
-            echo "  → Found in ANDROID_NDK: $NDK_LIBCXX"
-        fi
-    fi
-
-    # 备选：在系统路径中搜索
-    if [ -z "$LIBCXX_SOURCE" ]; then
-        echo "  → Searching system paths..."
-        LIBCXX_SOURCE=$(find / -path "*/${TARGET_TRIPLE}/libc++_shared.so" -type f 2>/dev/null | head -1)
-        if [ -n "$LIBCXX_SOURCE" ]; then
-            echo "  → Found at: $LIBCXX_SOURCE"
-        fi
+        LIBCXX_SOURCE="$(find_ndk_libcxx "$ANDROID_NDK" || true)"
+        [ -z "$LIBCXX_SOURCE" ] || echo "  → Found in ANDROID_NDK: $LIBCXX_SOURCE"
     fi
 
     if [ -z "$LIBCXX_SOURCE" ]; then
@@ -214,6 +232,10 @@ if [ "$BUILD_TYPE" = "dynamic" ]; then
         echo "  请通过 --ndk 参数指定 NDK 路径，或设置 NDK/ANDROID_NDK_HOME 环境变量。"
         echo "  libc++_shared.so 在 NDK 中的位置:"
         echo "    \$NDK/toolchains/llvm/prebuilt/<host>/sysroot/usr/lib/$TARGET_TRIPLE/libc++_shared.so"
+        exit 1
+    fi
+
+    if ! validate_android_shared_library "$LIBCXX_SOURCE"; then
         exit 1
     fi
 

@@ -58,7 +58,7 @@
 | `enable` | bool | true | 启用调度模块 |
 | `case_insensitive` | bool | false | 正则匹配忽略大小写，开启后 `surfaceflinger` 可匹配 `SurfaceFlinger` |
 | `refresh_interval_ms` | int | 2000 | 全量校准间隔（毫秒）。从本次全量扫描完成后开始计时。模板建议设为 2000。 |
-| `highspeed_sched_ms` | int | 300 | 高频扫描间隔（毫秒），仅扫描 top-app、`pinned` 和满足条件的 `topfore` PID。默认模板为竞争性前台调度采用 20ms；普通配置可从 100-300ms 起步。 |
+| `highspeed_sched_ms` | int | 300 | 目标扫描间隔（毫秒），仅扫描 top-app、`pinned` 和满足条件的 `topfore` PID。默认模板采用 300ms；确有低延迟需求时可从 100-300ms 逐步调整。 |
 | `top_scan_budget_us` | int | 4000 | 高频扫描的线程读取/投递时间预算，范围 500-20000 微秒。 |
 | `full_scan_budget_us` | int | 12000 | 全量校准后分派线程的时间预算，范围 1000-50000 微秒。 |
 | `scan_batch_size` | int | 32 | 每读取多少个线程后检查批量让出策略，范围 1-256。 |
@@ -74,7 +74,7 @@
 | 参数 | 默认值 | 有效范围 | 降低后的效果与代价 |
 |------|--------|----------|--------------------|
 | `event_throttle_ms` | 50ms | 0-5000 | 更快处理进程创建/退出事件，但事件突发时回调与锁竞争增加；0 表示不额外合并等待。 |
-| `min_schedule_interval_ms` | 200ms | 0-60000 | 更快重新处理同一非 TOP 线程的同状态任务，但增加状态核验和系统调用；TOP 不受此抑制。0 表示不抑制。 |
+| `min_schedule_interval_ms` | 200ms | 0-60000 | 更快重新处理同一线程的同状态任务，但增加状态核验和系统调用；TOP、pinned、topfore 同样受此参数抑制，状态变化和首次投递不受影响。0 表示不抑制。 |
 | `schedule_cleanup_interval_ms` | 5000ms | 100-600000 | 更快清理工作线程中的调度时间记录，但清理遍历更频繁；它不是扫描周期。 |
 | `cgroup_check_interval_ms` | 1000ms | 0-60000 | 更快发现外部 cgroup 漂移，但增加 `/proc/<pid>/task/<tid>/cgroup` 读取；0 表示每次候选任务都检查。 |
 | `cpuset_retry_count` | 3 | 1-20 | 降低可缩短失败路径，但瞬时失败恢复能力降低。此值是总尝试次数。 |
@@ -323,12 +323,14 @@ JSON 中反斜杠必须再次转义；例如要匹配包名中的字面量点号
 
 ## 调度周期
 
-程序采用“高频目标扫描 + 低频全量校准”模型：
+程序采用“目标扫描 + 低频全量校准”模型。目标扫描、同状态重复调度和 cgroup 漂移复查分别由配置参数独立限频：
 
 ```text
-每 `highspeed_sched_ms`（默认模板为 20ms）：
+每 `highspeed_sched_ms`（默认模板为 300ms）：
   仅扫描上一次校准得到的 top-app PID、pinned PID、以及处于 FG 的 topfore PID。
   线程读取与任务投递最多占用 top_scan_budget_us；预算耗尽后记录 PID/TID 游标，下一轮续扫。
+  包括 TOP 在内的同状态重复任务受 `timing.min_schedule_interval_ms` 限制；首次投递和状态变化仍立即处理。
+  包括 TOP、pinned、topfore 在内的 cgroup 漂移读取受 `timing.cgroup_check_interval_ms` 限制。
 
 每 refresh_interval_ms（从上一轮全量扫描结束后计时）：
   遍历 /proc，刷新 top-app / FG / pinned / topfore PID 集合，清理死亡 PID；

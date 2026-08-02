@@ -4,6 +4,7 @@
 #include <string>
 #include <optional>
 #include "../config/config_types.hpp"
+#include "../core/thread_matcher.hpp"
 #include "../utils/file_utils.hpp"
 #include "../utils/logger.hpp"
 

@@ -54,8 +54,8 @@ if(NOT nlohmann_json_FOUND)
         FetchContent_Declare(
             nlohmann_json
             GIT_REPOSITORY https://github.com/nlohmann/json.git
-            GIT_TAG v3.11.3
-            GIT_SHALLOW TRUE
+            # nlohmann/json v3.11.3 (MIT); pin the immutable release commit.
+            GIT_TAG 9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03
         )
         FetchContent_MakeAvailable(nlohmann_json)
     endif()
