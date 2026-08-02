@@ -546,7 +546,8 @@ bool advance_full_scan(ThreadMatcher& matcher, ThreadCache& cache,
             pid, scan.current_cmdline);
         if (scan.current_state == ProcessState::BG
             && should_dispatch_background_process(
-                result, scan.baseline_pids.count(pid) > 0)) {
+                result, scan.baseline_pids.count(pid) > 0,
+                scan.current_cmdline.empty())) {
             scan.background_pids.insert(pid);
         }
         if (result.matched) {
@@ -734,6 +735,7 @@ bool restore_all_thread_baselines(ThreadCache& cache, CpusetSetter& cpuset,
         if (restored) {
             cache.clear_baseline(pid, tid);
             cache.clear_applied_result(pid, tid);
+            cache.clear_managed_components(pid, tid);
         } else {
             all_restored = false;
         }
@@ -957,7 +959,10 @@ int main(int argc, char* argv[]) {
                     } else if (actual_state == ProcessState::FG) {
                         rule_dispatch_incomplete = dispatch_foreground_to_workers(
                             workers, single_pid, processed, budget, cursor);
-                    } else if (actual_state == ProcessState::BG) {
+                    } else if (actual_state == ProcessState::BG
+                               && should_dispatch_background_process(
+                                   result, cache_ptr->has_baseline_for_pid(pid),
+                                   cmdline.empty())) {
                         rule_dispatch_incomplete = dispatch_background_to_workers(
                             workers, single_pid, processed, budget, cursor);
                     }

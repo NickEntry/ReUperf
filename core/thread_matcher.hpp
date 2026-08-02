@@ -35,7 +35,11 @@ inline bool has_resolved_affinity(const MatchResult& result) {
 }
 
 inline bool should_dispatch_background_process(const MatchResult& result,
-                                               bool has_baseline) {
+                                               bool has_baseline,
+                                               bool kernel_thread = false) {
+    if (kernel_thread && !has_baseline && result.matched_rule_name == "Default rule") {
+        return false;
+    }
     return result.matched || has_baseline;
 }
 

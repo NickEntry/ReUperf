@@ -58,7 +58,7 @@
 | `enable` | bool | true | 启用调度模块 |
 | `case_insensitive` | bool | false | 正则匹配忽略大小写，开启后 `surfaceflinger` 可匹配 `SurfaceFlinger` |
 | `refresh_interval_ms` | int | 2000 | 全量校准间隔（毫秒）。从本次全量扫描完成后开始计时。模板建议设为 2000。 |
-| `highspeed_sched_ms` | int | 300 | 高频扫描间隔（毫秒），仅扫描 top-app、`pinned` 和满足条件的 `topfore` PID。模板建议设为 300。 |
+| `highspeed_sched_ms` | int | 300 | 高频扫描间隔（毫秒），仅扫描 top-app、`pinned` 和满足条件的 `topfore` PID。默认模板为竞争性前台调度采用 20ms；普通配置可从 100-300ms 起步。 |
 | `top_scan_budget_us` | int | 4000 | 高频扫描的线程读取/投递时间预算，范围 500-20000 微秒。 |
 | `full_scan_budget_us` | int | 12000 | 全量校准后分派线程的时间预算，范围 1000-50000 微秒。 |
 | `scan_batch_size` | int | 32 | 每读取多少个线程后检查批量让出策略，范围 1-256。 |
@@ -296,9 +296,9 @@ JSON 中反斜杠必须再次转义；例如要匹配包名中的字面量点号
 
 | 状态 | 条件 |
 |------|------|
-| TOP | 进程在 `/dev/cpuset/top-app` 或 `pinned=true` 或 (`topfore=true` 且 FG) |
-| FG | 进程在 `/dev/cpuset/foreground` |
-| BG | 其他进程 |
+| TOP | 进程的 `cpu` controller 路径为 `/top-app`，或 `pinned=true`，或 (`topfore=true` 且 FG) |
+| FG | 进程的 `cpu` controller 路径为 `/foreground` |
+| BG | 进程的 `cpu` controller 路径为 `/background` 或 `/system-background` |
 
 ## 示例：限制特定线程
 
@@ -326,7 +326,7 @@ JSON 中反斜杠必须再次转义；例如要匹配包名中的字面量点号
 程序采用“高频目标扫描 + 低频全量校准”模型：
 
 ```text
-每 highspeed_sched_ms：
+每 `highspeed_sched_ms`（默认模板为 20ms）：
   仅扫描上一次校准得到的 top-app PID、pinned PID、以及处于 FG 的 topfore PID。
   线程读取与任务投递最多占用 top_scan_budget_us；预算耗尽后记录 PID/TID 游标，下一轮续扫。
 
@@ -355,5 +355,6 @@ JSON 中反斜杠必须再次转义；例如要匹配包名中的字面量点号
 - 忽略 `idle` 和 `boost` 状态
 - `touch` 在内部重命名为 `top`
 - 市售 Android 设备即使底层采用 unified cgroup v2，通常仍会暴露 `/dev/cpuset`、`/dev/cpuctl` 等 Android 兼容路径；底层 cgroup 版本本身不是功能可用性的判断依据。
-- cpuset/cpuctl 限制以目标组实际暴露且可写的 `tasks`、`cpu.uclamp.max`、`cpu.shares` 等控制文件为准。线程会直接写入目标组的 `tasks`，以实现线程级迁移；缺失或不可写的控制文件会被记录并跳过。
+- ReUperf cpuset 组统一创建于 `/dev/cpuset/top-app/ReUperf_<mask>`；进程状态仍以独立 `cpu` controller 的 `top-app`、`foreground`、`background`、`system-background` 路径判断，不能从 cpuset 路径反推。
+- cpuset/cpuctl 限制以目标组实际暴露且可写的 `tasks`、`cpu.uclamp.max`、`cpu.shares` 等控制文件为准。程序以 `open(O_WRONLY|O_CLOEXEC)` 加单次/完整 `write()` 向 cgroup 控制文件提交 TID，不使用普通文件截断，也不需要 `O_APPEND`；缺失或不可写的控制文件会被记录。
 - SELinux、内核策略或厂商实现可能拒绝 cgroup 迁移或参数设置；CPU affinity 和优先级设置同样需要内核接口与足够权限。

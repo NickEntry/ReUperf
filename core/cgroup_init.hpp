@@ -93,6 +93,14 @@ public:
         return !cpus.empty() && !mems.empty();
     }
 
+    static std::string cpuset_parent_path() {
+        return "/dev/cpuset/top-app";
+    }
+
+    static std::string cpuset_group_path(const std::string& mask_name) {
+        return cpuset_parent_path() + "/ReUperf_" + mask_name;
+    }
+
 private:
     static std::set<std::string> list_child_directories(const std::string& path) {
         std::set<std::string> names;
@@ -117,14 +125,22 @@ private:
     }
 
     static void report_stale_groups(const Config& config) {
+        const std::string cpuset_parent = cpuset_parent_path();
         std::set<std::string> expected_cpuset;
         for (const auto& [name, cpus] : config.sched.cpumask) {
             (void)cpus;
             expected_cpuset.insert("ReUperf_" + name);
         }
-        for (const auto& name : list_child_directories("/dev/cpuset")) {
+        for (const auto& name : list_child_directories(cpuset_parent)) {
             if (name.rfind("ReUperf_", 0) == 0 && expected_cpuset.count(name) == 0) {
-                LOG_W("CgroupInit", "Stale cpuset group retained for safety: /dev/cpuset/" + name);
+                LOG_W("CgroupInit", "Stale cpuset group retained for safety: "
+                      + cpuset_parent + "/" + name);
+            }
+        }
+        for (const auto& name : list_child_directories("/dev/cpuset")) {
+            if (name.rfind("ReUperf_", 0) == 0) {
+                LOG_W("CgroupInit", "Legacy root cpuset group retained for safety: /dev/cpuset/"
+                      + name);
             }
         }
 
@@ -186,29 +202,30 @@ private:
             LOG_W("CgroupInit", "/dev/cpuset not found, skipping cpuset init");
             return true;
         }
-        if (!FileUtils::file_exists("/dev/cpuset/cpus")) {
-            LOG_W("CgroupInit", "cpuset not properly mounted (missing /dev/cpuset/cpus), skipping");
-            return true;
-        }
-
-        const std::string all_cpus = CpuMask::get_all_cpus_string();
-        LOG_I("CgroupInit", "Detected all CPUs: " + all_cpus);
-        if (all_cpus.empty()) {
-            LOG_E("CgroupInit", "No CPUs detected, cannot initialize cpuset");
+        const std::string base_path = cpuset_parent_path();
+        if (!FileUtils::dir_exists(base_path)
+            || !FileUtils::file_exists(base_path + "/cpus")) {
+            LOG_E("CgroupInit", "top-app cpuset is unavailable: " + base_path);
             return false;
         }
 
-        const std::string base_path = "/dev/cpuset";
-        const std::string root_mems = FileUtils::read_file(base_path + "/mems");
-        if (root_mems.empty()) {
-            LOG_E("CgroupInit", "Root cpuset mems is empty or unreadable");
+        const std::string parent_cpus = FileUtils::read_file(base_path + "/cpus");
+        LOG_I("CgroupInit", "top-app parent CPUs: " + parent_cpus);
+        if (parent_cpus.empty()) {
+            LOG_E("CgroupInit", "top-app cpuset CPUs are empty or unreadable");
+            return false;
+        }
+
+        const std::string parent_mems = FileUtils::read_file(base_path + "/mems");
+        if (parent_mems.empty()) {
+            LOG_E("CgroupInit", "top-app cpuset mems is empty or unreadable");
             return false;
         }
         int created = 0;
         int failed = 0;
 
         for (const auto& cpumask : config.sched.cpumask) {
-            const std::string child_path = base_path + "/ReUperf_" + cpumask.first;
+            const std::string child_path = cpuset_group_path(cpumask.first);
             const bool group_was_ready = FileUtils::dir_exists(child_path)
                 && cpuset_group_requires_rollback(
                     FileUtils::read_file(child_path + "/cpus"),
@@ -238,8 +255,8 @@ private:
                 ++failed;
                 continue;
             }
-            if (!transaction.write(child_path + "/mems", root_mems, group_was_ready)) {
-                LOG_W("CgroupInit", "Failed to set mems for " + child_path);
+            if (!transaction.write(child_path + "/mems", parent_mems, group_was_ready)) {
+                LOG_W("CgroupInit", "Failed to set inherited mems for " + child_path);
                 ++failed;
                 continue;
             }
@@ -261,7 +278,7 @@ private:
             ++created;
         }
 
-        LOG_I("CgroupInit", "cpuset cgroups: " + std::to_string(created)
+        LOG_I("CgroupInit", "top-app cpuset cgroups: " + std::to_string(created)
               + " groups created, " + std::to_string(failed) + " failed");
         return failed == 0;
     }

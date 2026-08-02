@@ -194,8 +194,10 @@ public:
         sched_param param{};
         param.sched_priority = priority;
         if (sched_setscheduler(tid, policy, &param) != 0) {
+            const int error = errno;
             LOG_W("PrioritySetter", "Failed to restore scheduler for tid " + std::to_string(tid)
-                  + ": " + std::string(strerror(errno)));
+                  + " (errno=" + std::to_string(error) + ", "
+                  + std::string(strerror(error)) + ")");
             return false;
         }
 

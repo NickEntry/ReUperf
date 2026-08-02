@@ -21,7 +21,7 @@ ReUperf 是一个面向 Android 的线程级调度器，使用 uperf 风格的 J
    - `foreground` 对应 FG；
    - `background` 或 `system-background` 对应 BG。
 3. `cpu` controller 是进程状态的权威来源，且不会被 ReUperf 的线程级 cpuset 迁移改变。
-4. `/dev/cpuset` 存在，并提供可创建、可配置的子组以及可写的 `tasks`、`cpus`、`mems` 控制文件。
+4. `/dev/cpuset/top-app` 存在，并允许在其下创建、配置 `ReUperf_<mask>` 子组及写入 `tasks`、`cpus`、`mems` 控制文件。ReUperf 始终从独立的 `cpu` controller 判断 TOP/FG/BG，不使用线程当前的 cpuset controller 路径推断状态。
 5. 使用 cpuctl 限制时，`/dev/cpuctl` 及目标组的 `tasks`、`cpu.shares`、`cpu.uclamp.max` 等所需文件实际存在且可写。
 6. 内核和 SELinux 策略允许对目标 TID 执行 cgroup 迁移、`sched_setaffinity`、`sched_setscheduler` 和 `setpriority`。实时调度通常还需要等效于 `CAP_SYS_NICE` 的权限。
 7. 配置中的 CPU 编号必须对应设备实际 CPU；模板默认配置面向 8 核、CPU ID 为 0-7 的设备，其他拓扑应先调整 `cpumask`。
@@ -79,10 +79,10 @@ ctest --test-dir build --output-on-failure
 
 ## 状态恢复语义
 
-ReUperf 分别跟踪 affinity/cpuset、scheduler priority 和 cpuctl limit：
+ReUperf 分别跟踪 affinity/cpuset、scheduler priority 和 cpuctl limit。每个被尝试接管的维度都会独立记录，即使其他维度失败或该维度仅产生了部分副作用，后续规则移除它时仍会恢复对应 baseline：
 
 - 有效 affinity 变为空时，恢复原始 cpuset 与 affinity。
-- 应用有效 affinity 时，先迁入目标 cpuset，再设置目标 affinity；因此不同且互不相交的有效 CPU mask 之间可以直接切换。
+- 所有目标组位于 `/dev/cpuset/top-app/ReUperf_<mask>`。应用有效 affinity 时依次尝试“前置 affinity → 目标子组 → 后置 affinity”；首次目标迁移失败时增强执行“affinity → `/dev/cpuset/top-app/tasks` → affinity → 目标子组”，任何单步失败都不会阻止后续步骤，最终按实际 cpuset 与 affinity 复验结果判定，并最多立即补抢一轮。
 - priority 从受管理值变为 `0` 时，恢复原始 scheduler policy、priority 和 nice。
 - `enable_limit` 从 `true` 变为 `false` 时，恢复原始 cpuctl cgroup。
 - 热重载中若保留 `enable_limit=true` 但省略 `uclamp_max` 或 `cpu_share`，对应控制值会显式恢复为父 cgroup 的继承值，不沿用旧子组残留值。

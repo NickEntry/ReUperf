@@ -86,8 +86,10 @@ inline bool write_open_file(const std::string& path, const std::string& content,
                             const char* operation) {
     const int fd = open(path.c_str(), flags, 0644);
     if (fd < 0) {
-        LOG_E("FileUtils", std::string(operation) + " open failed: " + path + " ("
-              + std::string(strerror(errno)) + ")");
+        const int error = errno;
+        LOG_E("FileUtils", std::string(operation) + " open failed: " + path
+              + " (errno=" + std::to_string(error) + ", "
+              + std::string(strerror(error)) + ")");
         return false;
     }
 
@@ -95,11 +97,13 @@ inline bool write_open_file(const std::string& path, const std::string& content,
     while (written < content.size()) {
         const ssize_t ret = write(fd, content.data() + written, content.size() - written);
         if (ret < 0) {
-            if (errno == EINTR) {
+            const int error = errno;
+            if (error == EINTR) {
                 continue;
             }
-            LOG_E("FileUtils", std::string(operation) + " write failed: " + path + " ("
-                  + std::string(strerror(errno)) + ")");
+            LOG_E("FileUtils", std::string(operation) + " write failed: " + path
+                  + " (errno=" + std::to_string(error) + ", "
+                  + std::string(strerror(error)) + ")");
             close(fd);
             return false;
         }
@@ -555,11 +559,25 @@ struct CgroupStateInfo {
     bool reuperf_owned = false;
 };
 
+inline bool is_reuperf_cpuset_path(const std::string& cpuset_path) {
+    return cpuset_path.rfind("/top-app/ReUperf_", 0) == 0
+        || cpuset_path.rfind("/ReUperf_", 0) == 0;
+}
+
 inline CgroupStateInfo cgroup_paths_to_state_info(const std::string& cpu_path,
                                                    const std::string& cpuset_path) {
     const bool reuperf_owned = cpu_path.rfind("/ReUperf/", 0) == 0
-        || cpuset_path.rfind("/ReUperf_", 0) == 0;
-    return {cgroup_paths_to_state(cpu_path, cpuset_path), reuperf_owned};
+        || is_reuperf_cpuset_path(cpuset_path);
+    // The cpu controller remains authoritative even when the independent cpuset
+    // controller is nested under top-app. Never infer TOP from our own cpuset path.
+    const CgroupState cpu_state = cgroup_path_to_state(cpu_path);
+    if (cpu_state != CgroupState::OTHER) {
+        return {cpu_state, reuperf_owned};
+    }
+    if (reuperf_owned) {
+        return {CgroupState::OTHER, true};
+    }
+    return {cgroup_path_to_state(cpuset_path), false};
 }
 
 inline CgroupStateInfo get_cgroup_state_info(int pid) {

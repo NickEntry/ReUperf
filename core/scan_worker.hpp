@@ -275,7 +275,10 @@ private:
         const bool check_cpuset = !result.affinity_class.empty()
             && result.affinity_class != "auto" && !result.cpumask_name.empty();
         const bool check_cpuctl = result.enable_limit && result.thread_rule_index >= 0;
-        if ((!check_cpuset && !check_cpuctl) || !should_check_cgroup(task)) {
+        const bool aggressive_check = result.effective_state == ProcessState::TOP
+            || result.pinned || result.topfore;
+        if ((!check_cpuset && !check_cpuctl)
+            || (!aggressive_check && !should_check_cgroup(task))) {
             return false;
         }
 
@@ -286,7 +289,8 @@ private:
             // before applying and no stale success is cached.
             return true;
         }
-        if (check_cpuset && paths.cpuset != "/ReUperf_" + result.cpumask_name) {
+        if (check_cpuset
+            && paths.cpuset != "/top-app/ReUperf_" + result.cpumask_name) {
             return true;
         }
         const std::string expected_cpuctl = "/ReUperf/" + result.matched_rule_name
@@ -409,6 +413,7 @@ private:
         const auto baseline = cache.get_baseline(pid, tid);
         if (!baseline) {
             cache.clear_applied_result(pid, tid);
+            cache.clear_managed_components(pid, tid);
             return;
         }
 
@@ -426,6 +431,7 @@ private:
         if (restored) {
             cache.clear_baseline(pid, tid);
             cache.clear_applied_result(pid, tid);
+            cache.clear_managed_components(pid, tid);
         }
     }
 
@@ -448,53 +454,68 @@ private:
             return;
         }
 
-        const auto previously_applied = cache.get_applied_result(task.pid, task.tid);
-        const int previous_priority = previously_applied
-            ? matcher.get_prio_value(previously_applied->prio_class,
-                                     previously_applied->effective_state)
-            : 0;
-        const int current_priority = matcher.get_prio_value(
-            result.prio_class, result.effective_state);
-        if (should_restore_managed_affinity(previously_applied, result)
-            && !restore_affinity_baseline(task.tid, *baseline, cpuset)) {
-            LOG_W("ScanWorker", name_ + " skipped scheduling for tid " + std::to_string(task.tid)
-                  + " because its affinity baseline could not be restored");
-            return;
-        }
-        if (should_restore_managed_priority(previous_priority, current_priority)
-            && !restore_scheduler_baseline(task.tid, *baseline, prio)) {
-            LOG_W("ScanWorker", name_ + " skipped scheduling for tid " + std::to_string(task.tid)
-                  + " because its scheduler baseline could not be restored");
-            return;
-        }
-        if (should_restore_managed_limit(previously_applied, result)
-            && !restore_cpuctl_baseline(task.tid, *baseline, cpuctl)) {
-            LOG_W("ScanWorker", name_ + " skipped scheduling for tid " + std::to_string(task.tid)
-                  + " because its cpuctl baseline could not be restored");
-            return;
-        }
-
-        const bool cpuset_applied = cpuset.apply_with_result(task.pid, task.tid, result, cpuset_base);
-        const bool priority_applied = cpuset_applied
-            && prio.apply_with_result(task.pid, task.tid, result);
-        const bool cpuctl_applied = priority_applied
-            && cpuctl.apply_with_result(task.pid, task.tid, result);
-        if (cpuctl_applied) {
-            if (is_current_task_identity(task)) {
-                cache.update_applied_result(task.pid, task.tid, result);
-            } else {
-                cache.erase_thread_if_identity(task.pid, task.tid, task.process_start_time,
-                                               task.thread_start_time);
+        ManagedComponents managed = cache.get_managed_components(task.pid, task.tid);
+        if (should_restore_managed_component(managed.affinity, needs_affinity)) {
+            if (!restore_affinity_baseline(task.tid, *baseline, cpuset)) {
+                LOG_W("ScanWorker", name_ + " skipped scheduling for tid "
+                      + std::to_string(task.tid)
+                      + " because its affinity baseline could not be restored");
+                return;
             }
+            managed.affinity = false;
+            cache.set_managed_components(task.pid, task.tid, managed);
+        }
+        if (should_restore_managed_component(managed.priority, needs_priority)) {
+            if (!restore_scheduler_baseline(task.tid, *baseline, prio)) {
+                LOG_W("ScanWorker", name_ + " skipped scheduling for tid "
+                      + std::to_string(task.tid)
+                      + " because its scheduler baseline could not be restored");
+                return;
+            }
+            managed.priority = false;
+            cache.set_managed_components(task.pid, task.tid, managed);
+        }
+        if (should_restore_managed_component(managed.cpuctl, result.enable_limit)) {
+            if (!restore_cpuctl_baseline(task.tid, *baseline, cpuctl)) {
+                LOG_W("ScanWorker", name_ + " skipped scheduling for tid "
+                      + std::to_string(task.tid)
+                      + " because its cpuctl baseline could not be restored");
+                return;
+            }
+            managed.cpuctl = false;
+            cache.set_managed_components(task.pid, task.tid, managed);
+        }
+
+        // Do not connect state-changing operations with short-circuit operators. A
+        // temporary failure in one dimension must not suppress any later operation.
+        // Mark every requested dimension as managed after attempting it: a failed call
+        // can still have changed an earlier syscall or moved the thread partway.
+        const AffinityTakeoverResult affinity_result =
+            cpuset.apply_with_result(task.pid, task.tid, result, cpuset_base);
+        const bool priority_applied = prio.apply_with_result(task.pid, task.tid, result);
+        const bool cpuctl_applied = cpuctl.apply_with_result(task.pid, task.tid, result);
+        managed.affinity = managed.affinity || needs_affinity;
+        managed.priority = managed.priority || needs_priority;
+        managed.cpuctl = managed.cpuctl || result.enable_limit;
+        const bool affinity_applied = !needs_affinity || affinity_result.success();
+        if (is_current_task_identity(task)) {
+            cache.set_managed_components(task.pid, task.tid, managed);
+            if (affinity_applied && priority_applied && cpuctl_applied) {
+                cache.update_applied_result(task.pid, task.tid, result);
+                return;
+            }
+        } else {
+            cache.erase_thread_if_identity(task.pid, task.tid, task.process_start_time,
+                                           task.thread_start_time);
             return;
         }
 
-        LOG_W("ScanWorker", name_ + " rolling back incomplete scheduling for tid "
-              + std::to_string(task.tid));
-        // Never restore an old baseline onto a recycled TID.
-        if (is_current_task_identity(task)) {
-            restore_baseline(task.pid, task.tid, cache, cpuset, prio, cpuctl);
-        } else {
+        LOG_W("ScanWorker", name_ + " scheduling takeover incomplete for tid "
+              + std::to_string(task.tid) + "; preserving partial state for retry");
+        // A failed takeover does not mean management ended. Keep both the baseline and
+        // every successfully applied component; the next dispatch will retry. Only an
+        // actual rule/component removal or shutdown performs baseline restoration.
+        if (!is_current_task_identity(task)) {
             cache.erase_thread_if_identity(task.pid, task.tid, task.process_start_time,
                                            task.thread_start_time);
         }
@@ -544,8 +565,9 @@ private:
                     applied->prio_class, applied->effective_state);
                 const bool sched_changed = expected_prio != 0
                     && prio->is_sched_changed(task.tid, expected_prio);
-                const bool cgroup_changed = !affinity_changed && !sched_changed
-                    && is_cgroup_changed(task, *applied);
+                // Check each drift source independently. Detecting one mismatch must not
+                // suppress detection of another one in the same takeover cycle.
+                const bool cgroup_changed = is_cgroup_changed(task, *applied);
                 if (!affinity_changed && !sched_changed && !cgroup_changed) {
                     return;
                 }

@@ -69,8 +69,10 @@ public:
 
     static bool set_affinity(int tid, const cpu_set_t& set) {
         if (sched_setaffinity(tid, sizeof(cpu_set_t), &set) != 0) {
+            const int error = errno;
             LOG_E("CpuMask", "sched_setaffinity failed for tid " + std::to_string(tid)
-                  + ": " + std::string(strerror(errno)));
+                  + " (errno=" + std::to_string(error) + ", "
+                  + std::string(strerror(error)) + ")");
             return false;
         }
         return true;

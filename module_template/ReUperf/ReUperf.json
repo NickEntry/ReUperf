@@ -7,7 +7,7 @@
     "sched": {
       "enable": true,
       "refresh_interval_ms": 1200,
-      "highspeed_sched_ms": 150,
+      "highspeed_sched_ms": 20,
       "top_scan_budget_us": 6000,
       "full_scan_budget_us": 16000,
       "scan_batch_size": 48,

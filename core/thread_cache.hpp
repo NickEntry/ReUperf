@@ -34,6 +34,12 @@ struct StoredThreadBaseline {
     ThreadBaseline baseline;
 };
 
+struct ManagedComponents {
+    bool affinity = false;
+    bool priority = false;
+    bool cpuctl = false;
+};
+
 struct ThreadCacheEntry {
     int pid;
     int tid;
@@ -44,6 +50,7 @@ struct ThreadCacheEntry {
     ProcessState actual_state;
     MatchResult result;
     std::optional<MatchResult> applied_result;
+    ManagedComponents managed_components;
     std::string cpuset_base;
     std::string cpuctl_base;
     std::optional<ThreadBaseline> baseline;
@@ -95,7 +102,7 @@ public:
         }
         cache_[key] = ThreadCacheEntry{pid, tid, process_start_time, thread_start_time,
             thread_name, cmdline,
-            actual_state, result, std::nullopt, cpuset_base, cpuctl_base, std::nullopt};
+            actual_state, result, std::nullopt, {}, cpuset_base, cpuctl_base, std::nullopt};
     }
 
     std::optional<MatchResult> get_applied_result(int pid, int tid) const {
@@ -114,6 +121,22 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         const auto it = cache_.find(std::make_pair(pid, tid));
         if (it != cache_.end()) it->second.applied_result.reset();
+    }
+
+    ManagedComponents get_managed_components(int pid, int tid) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = cache_.find(std::make_pair(pid, tid));
+        return it == cache_.end() ? ManagedComponents{} : it->second.managed_components;
+    }
+
+    void set_managed_components(int pid, int tid, const ManagedComponents& components) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = cache_.find(std::make_pair(pid, tid));
+        if (it != cache_.end()) it->second.managed_components = components;
+    }
+
+    void clear_managed_components(int pid, int tid) {
+        set_managed_components(pid, tid, {});
     }
 
     void set_baseline(int pid, int tid, ThreadBaseline baseline) {
@@ -167,6 +190,15 @@ public:
             }
         }
         return pids;
+    }
+
+    bool has_baseline_for_pid(int pid) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [key, entry] : cache_) {
+            (void)key;
+            if (entry.pid == pid && entry.baseline) return true;
+        }
+        return false;
     }
 
     std::vector<StoredThreadBaseline> get_all_baselines() const {
@@ -236,6 +268,7 @@ public:
             it->second.thread_name.clear();
             it->second.cmdline.clear();
             it->second.applied_result.reset();
+            it->second.managed_components = {};
             ++it;
         }
     }

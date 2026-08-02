@@ -26,9 +26,10 @@ ReUperf 是基于 uperf JSON 配置格式的 Android 线程调度器。它通过
 
 ### 进程状态
 
-- **BG**：不在 foreground/top-app cpuset 的进程。
-- **FG**：位于 `foreground` cpuset 的进程。
-- **TOP**：位于 `top-app` cpuset 的进程。
+- **BG**：`cpu` controller 路径为 `/background` 或 `/system-background` 的进程。
+- **FG**：`cpu` controller 路径为 `/foreground` 的进程。
+- **TOP**：`cpu` controller 路径为 `/top-app` 的进程。
+- `cpu` controller 是状态权威来源；ReUperf 对 cpuset controller 的线程级迁移不会改变进程状态判定。
 - `pinned=true` 会将规则有效状态固定为 TOP；`topfore=true` 会在进程处于 FG 时提升为 TOP。
 
 ### 调度循环与事件
@@ -42,11 +43,12 @@ ReUperf 是基于 uperf JSON 配置格式的 Android 线程调度器。它通过
 ## cgroup 结构与线程迁移
 
 ```text
-/dev/cpuset/ReUperf_{cpumask_name}
+/dev/cpuset/top-app/ReUperf_{cpumask_name}
 /dev/cpuctl/ReUperf/{rule_name}/A{thread_rule_index + 1}
 ```
 
 - cpuset 用于将线程放入与 cpumask 对应的组；同时会调用 `sched_setaffinity`。
+- affinity/cpuset、priority 和 cpuctl 的接管状态独立记录；即使整体应用失败，已尝试维度在规则移除时仍会恢复 baseline。
 - 当线程规则的 `enable_limit=true` 时，会创建对应的 cpuctl 子组，并按需设置 `cpu.uclamp.max` 与 `cpu.shares`。
 - 调度器将 **TID 直接写入最终目标 cgroup 的 `tasks` 文件**，从而保持线程级迁移；不会通过 `cgroup.procs` 迁移整个进程。
 

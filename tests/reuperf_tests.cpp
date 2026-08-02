@@ -16,6 +16,7 @@
 #include "core/event_router.hpp"
 #include "core/thread_cache.hpp"
 #include "core/thread_matcher.hpp"
+#include "scheduler/cpuset_setter.hpp"
 #include "scheduler/priority_setter.hpp"
 #include "utils/cpu_mask.hpp"
 #include "utils/file_utils.hpp"
@@ -191,9 +192,43 @@ void test_reuperf_cgroup_state_info() {
     const auto external = FileUtils::cgroup_paths_to_state_info("/", "/unknown");
     require(external.state == CgroupState::OTHER && !external.reuperf_owned,
             "unrecognized external paths were treated as ReUperf-owned");
-    const auto top = FileUtils::cgroup_paths_to_state_info("/top-app", "/ReUperf_big");
+    const auto top = FileUtils::cgroup_paths_to_state_info(
+        "/top-app", "/top-app/ReUperf_big");
     require(top.state == CgroupState::TOP,
             "recognized Android cpu state was hidden by a ReUperf cpuset");
+    const auto background = FileUtils::cgroup_paths_to_state_info(
+        "/background", "/top-app/ReUperf_big");
+    require(background.state == CgroupState::BG && background.reuperf_owned,
+            "top-app-nested ReUperf cpuset overrode the cpu-controller BG state");
+    const auto unknown_owned = FileUtils::cgroup_paths_to_state_info(
+        "/", "/top-app/ReUperf_big");
+    require(unknown_owned.state == CgroupState::OTHER && unknown_owned.reuperf_owned,
+            "ReUperf cpuset path incorrectly supplied a TOP fallback state");
+}
+
+void test_managed_component_tracking() {
+    ThreadCache cache;
+    MatchResult result;
+    cache.update(10, 11, 100, 101, "worker", "proc", ProcessState::TOP,
+                 result, "/dev/cpuset", "/dev/cpuctl");
+
+    ManagedComponents managed;
+    managed.affinity = true;
+    managed.priority = true;
+    cache.set_managed_components(10, 11, managed);
+
+    const ManagedComponents stored = cache.get_managed_components(10, 11);
+    require(stored.affinity && stored.priority && !stored.cpuctl,
+            "independent managed components were not retained");
+    require(!cache.get_applied_result(10, 11),
+            "partial component tracking incorrectly claimed full application");
+    require(should_restore_managed_component(stored.affinity, false),
+            "partially applied affinity would not be restored when removed");
+
+    cache.clear_managed_components(10, 11);
+    const ManagedComponents cleared = cache.get_managed_components(10, 11);
+    require(!cleared.affinity && !cleared.priority && !cleared.cpuctl,
+            "managed component state was not cleared after restoration");
 }
 
 void test_thread_cache_identity() {
@@ -292,6 +327,10 @@ void test_background_dispatch_eligibility() {
             "an unmanaged background process was dispatched without a baseline");
     require(should_dispatch_background_process(unmatched, true),
             "an unmatched process with a baseline was not dispatched for restoration");
+    require(!should_dispatch_background_process(default_rule, false, true),
+            "a kernel thread was dispatched through Default rule");
+    require(should_dispatch_background_process(default_rule, true, true),
+            "a kernel thread with an old baseline was not dispatched for cleanup");
 }
 
 void test_inherited_limit_resolution() {
@@ -303,6 +342,11 @@ void test_inherited_limit_resolution() {
             "complete existing cpuset was not protected by rollback");
     require(!CgroupInitializer::cpuset_group_requires_rollback("0-7", ""),
             "half-initialized cpuset was treated as a valid rollback baseline");
+    require(CgroupInitializer::cpuset_parent_path() == "/dev/cpuset/top-app",
+            "ReUperf cpuset parent is not top-app");
+    require(CgroupInitializer::cpuset_group_path("c2")
+                == "/dev/cpuset/top-app/ReUperf_c2",
+            "ReUperf cpuset group path was constructed incorrectly");
 }
 
 void test_resolved_affinity_detection() {
@@ -347,6 +391,85 @@ void test_resolved_affinity_detection() {
     result.affinity_class = "auto";
     result.cpumask_name = "c2";
     require(!has_resolved_affinity(result), "auto affinity was treated as active");
+}
+
+void test_affinity_takeover_sequence() {
+    std::vector<std::string> calls;
+    int affinity_calls = 0;
+    int verify_calls = 0;
+    const auto result = CpusetSetter::run_takeover_sequence(
+        100, 101, "c2", {7},
+        [&](int tid, const std::vector<int>& cpus) {
+            require(tid == 101 && cpus == std::vector<int>{7},
+                    "takeover passed incorrect affinity arguments");
+            calls.push_back("affinity");
+            return ++affinity_calls != 1;
+        },
+        [&](int tid, const std::string& mask_name) {
+            require(tid == 101 && mask_name == "c2",
+                    "takeover passed incorrect cpuset arguments");
+            calls.push_back("cpuset");
+            return true;
+        },
+        [&](int tid) {
+            require(tid == 101, "takeover passed incorrect parent cpuset arguments");
+            calls.push_back("parent");
+            return true;
+        },
+        [&](int pid, int tid, const std::string& mask_name) {
+            require(pid == 100 && tid == 101 && mask_name == "c2",
+                    "takeover passed incorrect cpuset verification arguments");
+            calls.push_back("verify_cpuset");
+            return ++verify_calls >= 2;
+        },
+        [&](int tid, const std::vector<int>& cpus) {
+            require(tid == 101 && cpus == std::vector<int>{7},
+                    "takeover passed incorrect affinity verification arguments");
+            calls.push_back("verify_affinity");
+            return verify_calls >= 2;
+        });
+
+    require(result.success() && result.attempts == 2,
+            "takeover did not retry after final verification failed");
+    const std::vector<std::string> expected = {
+        "affinity", "cpuset", "affinity", "verify_cpuset", "verify_affinity",
+        "affinity", "cpuset", "affinity", "verify_cpuset", "verify_affinity"};
+    require(calls == expected, "takeover operations were skipped or executed out of order");
+    require(result.pre_affinity_succeeded && result.cpuset_succeeded
+                && result.post_affinity_succeeded,
+            "successful retry did not retain the final operation results");
+}
+
+void test_affinity_takeover_failure_does_not_short_circuit() {
+    std::vector<std::string> calls;
+    const auto result = CpusetSetter::run_takeover_sequence(
+        1, 2, "c2", {7},
+        [&](int, const std::vector<int>&) {
+            calls.push_back("affinity");
+            return false;
+        },
+        [&](int, const std::string&) {
+            calls.push_back("cpuset");
+            return false;
+        },
+        [&](int) {
+            calls.push_back("parent");
+            return false;
+        },
+        [&](int, int, const std::string&) {
+            calls.push_back("verify_cpuset");
+            return false;
+        },
+        [&](int, const std::vector<int>&) {
+            calls.push_back("verify_affinity");
+            return false;
+        }, 1);
+    require(!result.success(), "failed takeover was reported as successful");
+    const std::vector<std::string> expected = {
+        "affinity", "cpuset", "affinity", "parent", "affinity", "cpuset",
+        "affinity", "verify_cpuset", "verify_affinity"};
+    require(calls == expected,
+            "a failed takeover step suppressed or reordered enhanced recovery");
 }
 
 void test_match_result_equality() {
@@ -413,10 +536,13 @@ int main() {
     test_main_thread_identity();
     test_home_package_regex_is_literal();
     test_reuperf_cgroup_state_info();
+    test_managed_component_tracking();
     test_thread_cache_identity();
     test_background_dispatch_eligibility();
     test_inherited_limit_resolution();
     test_resolved_affinity_detection();
+    test_affinity_takeover_sequence();
+    test_affinity_takeover_failure_does_not_short_circuit();
     test_match_result_equality();
     test_priority_policy_mapping();
     test_event_router_throttle();
