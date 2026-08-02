@@ -558,7 +558,7 @@ private:
             return;
         }
 
-        LOG_W("ScanWorker", name_ + " scheduling takeover incomplete for tid "
+        LOG_T("ScanWorker", name_ + " scheduling takeover incomplete for tid "
               + std::to_string(task.tid) + "; preserving partial state for retry");
         // A failed takeover does not mean management ended. Keep both the baseline and
         // every successfully applied component; the next dispatch will retry. Only an

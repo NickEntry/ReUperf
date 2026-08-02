@@ -147,6 +147,48 @@ void test_cpu_mask_formatting() {
             "single CPU mask formatting failed");
 }
 
+void test_runtime_failure_log_levels() {
+    const auto log_path = std::filesystem::temp_directory_path()
+        / "reuperf-runtime-failure-levels.log";
+    std::filesystem::remove(log_path);
+    const std::string missing_control_file =
+        "/reuperf-test-missing/control/tasks";
+
+    Logger::instance().init(LogLevel::INFO, log_path.string(), false);
+    require(!FileUtils::write_kernel_control_file(missing_control_file, "1"),
+            "missing control file unexpectedly accepted a default write");
+    require(!FileUtils::write_kernel_control_file(
+                missing_control_file, "1", LogLevel::TRACE),
+            "missing control file unexpectedly accepted a write");
+    {
+        std::ifstream input(log_path);
+        const std::string log(std::istreambuf_iterator<char>(input), {});
+        const size_t first_failure = log.find("write_kernel_control_file open failed");
+        require(log.find("[ERROR] FileUtils: write_kernel_control_file open failed")
+                    != std::string::npos,
+                "default control-file failure no longer used ERROR logging");
+        require(first_failure != std::string::npos
+                    && log.find("write_kernel_control_file open failed", first_failure + 1)
+                        == std::string::npos,
+                "TRACE runtime write failure leaked into INFO logging");
+    }
+
+    Logger::instance().init(LogLevel::TRACE, log_path.string(), false);
+    require(!FileUtils::write_kernel_control_file(
+                missing_control_file, "1", LogLevel::TRACE),
+            "missing control file unexpectedly accepted a TRACE write");
+    {
+        std::ifstream input(log_path);
+        const std::string log(std::istreambuf_iterator<char>(input), {});
+        require(log.find("[TRACE] FileUtils: write_kernel_control_file open failed")
+                    != std::string::npos,
+                "TRACE runtime write failure was not available for diagnosis");
+    }
+
+    std::filesystem::remove(log_path);
+    Logger::instance().init(LogLevel::ERR, "", false);
+}
+
 void test_main_thread_identity() {
     Config config;
     ProcessRule process_rule;
@@ -678,6 +720,7 @@ int main() {
     test_config_validation();
     test_timing_config();
     test_cpu_mask_formatting();
+    test_runtime_failure_log_levels();
     test_main_thread_identity();
     test_home_package_regex_is_literal();
     test_reuperf_cgroup_state_info();

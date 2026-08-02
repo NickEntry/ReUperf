@@ -67,20 +67,24 @@ public:
         return to_string(to_vector(set));
     }
 
-    static bool set_affinity(int tid, const cpu_set_t& set) {
+    static bool set_affinity(int tid, const cpu_set_t& set,
+                             LogLevel failure_level = LogLevel::ERR) {
         if (sched_setaffinity(tid, sizeof(cpu_set_t), &set) != 0) {
             const int error = errno;
-            LOG_E("CpuMask", "sched_setaffinity failed for tid " + std::to_string(tid)
-                  + " (errno=" + std::to_string(error) + ", "
-                  + std::string(strerror(error)) + ")");
+            Logger::instance().log_lazy(failure_level, "CpuMask", [&]() {
+                return "sched_setaffinity failed for tid " + std::to_string(tid)
+                    + " (errno=" + std::to_string(error) + ", "
+                    + std::string(strerror(error)) + ")";
+            });
             return false;
         }
         return true;
     }
 
-    static bool set_affinity(int tid, const std::vector<int>& cpus) {
+    static bool set_affinity(int tid, const std::vector<int>& cpus,
+                             LogLevel failure_level = LogLevel::ERR) {
         if (cpus.empty()) return true;
-        return set_affinity(tid, from_vector(cpus));
+        return set_affinity(tid, from_vector(cpus), failure_level);
     }
 
     static std::vector<int> get_affinity_from_status(int tid) {

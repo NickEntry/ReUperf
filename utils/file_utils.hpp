@@ -83,13 +83,17 @@ inline bool is_dynamic_kernel_path(const std::string& path) {
 inline void invalidate_file_cache(const std::string& path);
 
 inline bool write_open_file(const std::string& path, const std::string& content, int flags,
-                            const char* operation) {
+                            const char* operation,
+                            LogLevel failure_level = LogLevel::ERR) {
+    const auto log_failure = [&](const std::string& message) {
+        Logger::instance().log_lazy(failure_level, "FileUtils", [&]() { return message; });
+    };
     const int fd = open(path.c_str(), flags, 0644);
     if (fd < 0) {
         const int error = errno;
-        LOG_E("FileUtils", std::string(operation) + " open failed: " + path
-              + " (errno=" + std::to_string(error) + ", "
-              + std::string(strerror(error)) + ")");
+        log_failure(std::string(operation) + " open failed: " + path
+                    + " (errno=" + std::to_string(error) + ", "
+                    + std::string(strerror(error)) + ")");
         return false;
     }
 
@@ -101,14 +105,14 @@ inline bool write_open_file(const std::string& path, const std::string& content,
             if (error == EINTR) {
                 continue;
             }
-            LOG_E("FileUtils", std::string(operation) + " write failed: " + path
-                  + " (errno=" + std::to_string(error) + ", "
-                  + std::string(strerror(error)) + ")");
+            log_failure(std::string(operation) + " write failed: " + path
+                        + " (errno=" + std::to_string(error) + ", "
+                        + std::string(strerror(error)) + ")");
             close(fd);
             return false;
         }
         if (ret == 0) {
-            LOG_E("FileUtils", std::string(operation) + " write returned zero bytes: " + path);
+            log_failure(std::string(operation) + " write returned zero bytes: " + path);
             close(fd);
             return false;
         }
@@ -126,8 +130,10 @@ inline bool write_file(const std::string& path, const std::string& content) {
 
 // Kernel control files such as cgroup tasks, cpus and cpu.shares must already
 // exist. Do not create or truncate them: these pseudo-files define write semantics.
-inline bool write_kernel_control_file(const std::string& path, const std::string& content) {
-    return write_open_file(path, content, O_WRONLY | O_CLOEXEC, "write_kernel_control_file");
+inline bool write_kernel_control_file(const std::string& path, const std::string& content,
+                                      LogLevel failure_level = LogLevel::ERR) {
+    return write_open_file(path, content, O_WRONLY | O_CLOEXEC,
+                           "write_kernel_control_file", failure_level);
 }
 
 namespace {

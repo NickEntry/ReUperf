@@ -66,7 +66,8 @@ public:
         const std::string path = "/dev/cpuset/top-app/ReUperf_" + cpumask_name;
         if (!is_group_ready(path)) return false;
         for (int retry = 0; retry < timing_.cpuset_retry_count; ++retry) {
-            if (FileUtils::write_kernel_control_file(path + "/tasks", std::to_string(tid))) {
+            if (FileUtils::write_kernel_control_file(
+                    path + "/tasks", std::to_string(tid), LogLevel::TRACE)) {
                 LOG_T("CpusetSetter", "Moved tid " + std::to_string(tid) + " to cpuset " + path);
                 return true;
             }
@@ -76,7 +77,7 @@ public:
             }
         }
         invalidate_group(path);
-        LOG_W("CpusetSetter", "Failed to move tid " + std::to_string(tid) + " to " + path
+        LOG_D("CpusetSetter", "Failed to move tid " + std::to_string(tid) + " to " + path
               + " after " + std::to_string(timing_.cpuset_retry_count) + " attempts");
         return false;
     }
@@ -186,7 +187,7 @@ public:
         applied = run_takeover_sequence(
             pid, tid, result.cpumask_name, expected_cpus,
             [](int target_tid, const std::vector<int>& cpus) {
-                return CpuMask::set_affinity(target_tid, cpus);
+                return CpuMask::set_affinity(target_tid, cpus, LogLevel::TRACE);
             },
             [this](int target_tid, const std::string& mask_name) {
                 return move_to_cpuset_cgroup(target_tid, mask_name);
@@ -210,7 +211,7 @@ public:
             });
 
         if (!applied.success()) {
-            LOG_W("CpusetSetter", "Affinity takeover incomplete for tid "
+            LOG_D("CpusetSetter", "Affinity takeover incomplete for tid "
                   + std::to_string(tid) + " after " + std::to_string(applied.attempts)
                   + " attempts (pre=" + std::to_string(applied.pre_affinity_succeeded)
                   + ", initial_cpuset=" + std::to_string(applied.initial_cpuset_succeeded)
