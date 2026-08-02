@@ -16,7 +16,7 @@
 #   ./scripts/package_module.sh --binary build/thread_scheduler --arch arm64-v8a --type dynamic --ndk ~/android-ndk-r26b
 #   ./scripts/package_module.sh --binary build_static/thread_scheduler --arch arm64-v8a --type static
 
-set -e
+set -euo pipefail
 
 # ── 参数解析 ──────────────────────────────────────────────
 BINARY=""
@@ -59,10 +59,10 @@ if [ "$BUILD_TYPE" != "dynamic" ] && [ "$BUILD_TYPE" != "static" ]; then
 fi
 
 case "$ARCH" in
-    arm64-v8a)   TARGET_TRIPLE="aarch64-linux-android"    ; MAGISK_ARCH="arm64" ;;
-    armeabi-v7a) TARGET_TRIPLE="arm-linux-androideabi"    ; MAGISK_ARCH="arm"   ;;
-    x86_64)      TARGET_TRIPLE="x86_64-linux-android"     ; MAGISK_ARCH="x64"   ;;
-    x86)         TARGET_TRIPLE="i686-linux-android"       ; MAGISK_ARCH="x86"   ;;
+    arm64-v8a)   TARGET_TRIPLE="aarch64-linux-android" ; MAGISK_ARCH="arm64"; EXPECTED_MACHINE="AArch64" ;;
+    armeabi-v7a) TARGET_TRIPLE="arm-linux-androideabi" ; MAGISK_ARCH="arm"; EXPECTED_MACHINE="ARM" ;;
+    x86_64)      TARGET_TRIPLE="x86_64-linux-android" ; MAGISK_ARCH="x64"; EXPECTED_MACHINE="Advanced Micro Devices X86-64" ;;
+    x86)         TARGET_TRIPLE="i686-linux-android" ; MAGISK_ARCH="x86"; EXPECTED_MACHINE="Intel 80386" ;;
     *)
         echo "ERROR: Unsupported architecture: $ARCH"
         echo "Supported: arm64-v8a, armeabi-v7a, x86_64, x86"
@@ -77,6 +77,59 @@ OUTPUT_DIR="${OUTPUT_DIR:-$REPO_DIR/out}"
 # 确保是绝对路径（避免 cd 后路径失效）
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" 2>/dev/null && pwd || (mkdir -p "$OUTPUT_DIR" && cd "$OUTPUT_DIR" && pwd))"
 STAGING_DIR="$OUTPUT_DIR/.staging_${ARCH}_${BUILD_TYPE}"
+
+READELF=""
+for candidate in llvm-readelf readelf; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        READELF="$candidate"
+        break
+    fi
+done
+if [ -z "$READELF" ]; then
+    echo "ERROR: llvm-readelf or readelf is required to validate the target binary"
+    exit 1
+fi
+
+ELF_HEADER="$($READELF -h "$BINARY" 2>/dev/null)" || {
+    echo "ERROR: Binary is not a readable ELF file: $BINARY"
+    exit 1
+}
+ACTUAL_MACHINE="$(printf '%s\n' "$ELF_HEADER" | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')"
+if [ "$ACTUAL_MACHINE" != "$EXPECTED_MACHINE" ]; then
+    echo "ERROR: Binary architecture mismatch: expected $EXPECTED_MACHINE for $ARCH, got $ACTUAL_MACHINE"
+    exit 1
+fi
+if ! "$READELF" -W -S "$BINARY" 2>/dev/null | grep -Fq '.note.android.ident'; then
+    echo "ERROR: Binary lacks the Android NDK identification note"
+    exit 1
+fi
+
+PROGRAM_HEADERS="$($READELF -l "$BINARY" 2>/dev/null)"
+DYNAMIC_SECTION="$($READELF -d "$BINARY" 2>/dev/null || true)"
+INTERPRETER="$(printf '%s\n' "$PROGRAM_HEADERS" | sed -n 's/.*Requesting program interpreter: \([^]]*\).*/\1/p')"
+if [ -n "$INTERPRETER" ] && ! printf '%s\n' "$INTERPRETER" | grep -Eq '^/system/bin/linker(64)?$'; then
+    echo "ERROR: Binary uses a non-Android program interpreter: $INTERPRETER"
+    exit 1
+fi
+if printf '%s\n' "$DYNAMIC_SECTION" | grep -Eq 'Shared library: \[(libc\.so\.6|libstdc\+\+\.so\.6|libgcc_s\.so\.1)\]'; then
+    echo "ERROR: Binary depends on host GNU runtime libraries and is not an Android artifact"
+    exit 1
+fi
+if [ "$BUILD_TYPE" = "dynamic" ]; then
+    if [ -z "$INTERPRETER" ]; then
+        echo "ERROR: --type dynamic requires a dynamically linked Android executable"
+        exit 1
+    fi
+    if ! printf '%s\n' "$DYNAMIC_SECTION" | grep -Fq 'Shared library: [libc++_shared.so]'; then
+        echo "ERROR: Dynamic package requires the binary to depend on libc++_shared.so"
+        exit 1
+    fi
+else
+    if [ -n "$INTERPRETER" ] || printf '%s\n' "$DYNAMIC_SECTION" | grep -q '(NEEDED)'; then
+        echo "ERROR: --type static requires an executable without a dynamic interpreter or shared-library dependencies"
+        exit 1
+    fi
+fi
 
 # 版本号：优先使用 git commit 时间（统一），否则用当前时间
 if git -C "$REPO_DIR" rev-parse HEAD >/dev/null 2>&1; then
@@ -129,7 +182,7 @@ if [ "$BUILD_TYPE" = "dynamic" ]; then
     fi
 
     # 备选：从 ANDROID_NDK_HOME 环境变量
-    if [ -z "$LIBCXX_SOURCE" ] && [ -n "$ANDROID_NDK_HOME" ]; then
+    if [ -z "$LIBCXX_SOURCE" ] && [ -n "${ANDROID_NDK_HOME:-}" ]; then
         NDK_LIBCXX="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$TARGET_TRIPLE/libc++_shared.so"
         if [ -f "$NDK_LIBCXX" ]; then
             LIBCXX_SOURCE="$NDK_LIBCXX"
@@ -138,7 +191,7 @@ if [ "$BUILD_TYPE" = "dynamic" ]; then
     fi
 
     # 备选：从 ANDROID_NDK 环境变量
-    if [ -z "$LIBCXX_SOURCE" ] && [ -n "$ANDROID_NDK" ]; then
+    if [ -z "$LIBCXX_SOURCE" ] && [ -n "${ANDROID_NDK:-}" ]; then
         NDK_LIBCXX="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$TARGET_TRIPLE/libc++_shared.so"
         if [ -f "$NDK_LIBCXX" ]; then
             LIBCXX_SOURCE="$NDK_LIBCXX"
@@ -171,59 +224,14 @@ else
     echo "[3/6] Static build — skipping libc++_shared.so"
 fi
 
-# ── 下载 update-binary ────────────────────────────────────
-echo "[4/6] Fetching update-binary from Magisk official repo..."
-MAGISK_INSTALLER_URL="https://raw.githubusercontent.com/topjohnwu/Magisk/master/scripts/module_installer.sh"
+# ── 使用仓库内自有安装入口 ────────────────────────────────
+echo "[4/6] Using repository-local update-binary..."
 UPDATE_BINARY="$STAGING_DIR/META-INF/com/google/android/update-binary"
-
-if command -v curl &>/dev/null; then
-    if curl -sL --connect-timeout 10 "$MAGISK_INSTALLER_URL" -o "$UPDATE_BINARY"; then
-        echo "  → Downloaded via curl"
-    else
-        echo "  ✗ Download failed; using fallback"
-        echo '#!/sbin/sh' > "$UPDATE_BINARY"
-        echo 'umask 022' >> "$UPDATE_BINARY"
-        echo 'ui_print() { echo "$1"; }' >> "$UPDATE_BINARY"
-        echo 'require_new_magisk() { ui_print "Please install Magisk v20.4+!"; exit 1; }' >> "$UPDATE_BINARY"
-        echo 'OUTFD=$2; ZIPFILE=$3' >> "$UPDATE_BINARY"
-        echo 'mount /data 2>/dev/null' >> "$UPDATE_BINARY"
-        echo '[ -f /data/adb/magisk/util_functions.sh ] || require_new_magisk' >> "$UPDATE_BINARY"
-        echo '. /data/adb/magisk/util_functions.sh' >> "$UPDATE_BINARY"
-        echo '[ $MAGISK_VER_CODE -lt 20400 ] && require_new_magisk' >> "$UPDATE_BINARY"
-        echo 'install_module' >> "$UPDATE_BINARY"
-        echo 'exit 0' >> "$UPDATE_BINARY"
-    fi
-elif command -v wget &>/dev/null; then
-    if wget -q --timeout=10 "$MAGISK_INSTALLER_URL" -O "$UPDATE_BINARY"; then
-        echo "  → Downloaded via wget"
-    else
-        echo "  ✗ Download failed; using fallback"
-        echo '#!/sbin/sh' > "$UPDATE_BINARY"
-        echo 'umask 022' >> "$UPDATE_BINARY"
-        echo 'ui_print() { echo "$1"; }' >> "$UPDATE_BINARY"
-        echo 'require_new_magisk() { ui_print "Please install Magisk v20.4+!"; exit 1; }' >> "$UPDATE_BINARY"
-        echo 'OUTFD=$2; ZIPFILE=$3' >> "$UPDATE_BINARY"
-        echo 'mount /data 2>/dev/null' >> "$UPDATE_BINARY"
-        echo '[ -f /data/adb/magisk/util_functions.sh ] || require_new_magisk' >> "$UPDATE_BINARY"
-        echo '. /data/adb/magisk/util_functions.sh' >> "$UPDATE_BINARY"
-        echo '[ $MAGISK_VER_CODE -lt 20400 ] && require_new_magisk' >> "$UPDATE_BINARY"
-        echo 'install_module' >> "$UPDATE_BINARY"
-        echo 'exit 0' >> "$UPDATE_BINARY"
-    fi
-else
-    echo "  ✗ Neither curl nor wget found; using fallback"
-    echo '#!/sbin/sh' > "$UPDATE_BINARY"
-    echo 'umask 022' >> "$UPDATE_BINARY"
-    echo 'ui_print() { echo "$1"; }' >> "$UPDATE_BINARY"
-    echo 'require_new_magisk() { ui_print "Please install Magisk v20.4+!"; exit 1; }' >> "$UPDATE_BINARY"
-    echo 'OUTFD=$2; ZIPFILE=$3' >> "$UPDATE_BINARY"
-    echo 'mount /data 2>/dev/null' >> "$UPDATE_BINARY"
-    echo '[ -f /data/adb/magisk/util_functions.sh ] || require_new_magisk' >> "$UPDATE_BINARY"
-    echo '. /data/adb/magisk/util_functions.sh' >> "$UPDATE_BINARY"
-    echo '[ $MAGISK_VER_CODE -lt 20400 ] && require_new_magisk' >> "$UPDATE_BINARY"
-    echo 'install_module' >> "$UPDATE_BINARY"
-    echo 'exit 0' >> "$UPDATE_BINARY"
+if [ ! -f "$UPDATE_BINARY" ]; then
+    echo "ERROR: Local update-binary is missing: $UPDATE_BINARY"
+    exit 1
 fi
+chmod 0755 "$UPDATE_BINARY"
 
 # ── 生成 module.prop ──────────────────────────────────────
 echo "[5/6] Generating module.prop..."

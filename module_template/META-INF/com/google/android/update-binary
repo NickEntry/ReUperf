@@ -1,0 +1,33 @@
+#!/sbin/sh
+# SPDX-License-Identifier: MIT
+# ReUperf Magisk module installation entry point.
+
+umask 022
+
+print_message() {
+  echo "$1"
+}
+
+fail_unsupported_magisk() {
+  print_message "*******************************"
+  print_message " Please install Magisk v20.4+! "
+  print_message "*******************************"
+  exit 1
+}
+
+OUTFD=$2
+ZIPFILE=$3
+
+mount /data 2>/dev/null
+
+MAGISK_UTILS=/data/adb/magisk/util_functions.sh
+[ -f "$MAGISK_UTILS" ] || fail_unsupported_magisk
+. "$MAGISK_UTILS"
+
+case "$MAGISK_VER_CODE" in
+  ''|*[!0-9]*) fail_unsupported_magisk ;;
+esac
+[ "$MAGISK_VER_CODE" -ge 20400 ] || fail_unsupported_magisk
+
+install_module
+exit $?

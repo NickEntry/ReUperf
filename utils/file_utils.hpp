@@ -471,7 +471,8 @@ inline std::string get_cgroup_path_from_file(const std::string& cgroup_file,
 
 inline std::string get_cgroup_path(int pid, const std::string& controller) {
     return get_cgroup_path_from_file(
-        "/proc/" + std::to_string(pid) + "/cgroup", pid, controller);
+        "/proc/" + std::to_string(pid) + "/cgroup",
+        static_cast<uint64_t>(static_cast<uint32_t>(pid)), controller);
 }
 
 inline std::string get_thread_cgroup_path(int pid, int tid, const std::string& controller) {

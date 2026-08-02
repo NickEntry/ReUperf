@@ -14,6 +14,7 @@
 #include "config/config_parser.hpp"
 #include "core/cgroup_init.hpp"
 #include "core/event_router.hpp"
+#include "core/restoration_retry.hpp"
 #include "core/thread_cache.hpp"
 #include "core/thread_matcher.hpp"
 #include "scheduler/cpuset_setter.hpp"
@@ -427,7 +428,8 @@ void test_affinity_takeover_sequence() {
                     "takeover passed incorrect affinity verification arguments");
             calls.push_back("verify_affinity");
             return verify_calls >= 2;
-        });
+        },
+        [] { return true; });
 
     require(result.success() && result.attempts == 2,
             "takeover did not retry after final verification failed");
@@ -463,13 +465,96 @@ void test_affinity_takeover_failure_does_not_short_circuit() {
         [&](int, const std::vector<int>&) {
             calls.push_back("verify_affinity");
             return false;
-        }, 1);
+        },
+        [] { return true; }, 1);
     require(!result.success(), "failed takeover was reported as successful");
     const std::vector<std::string> expected = {
         "affinity", "cpuset", "affinity", "parent", "affinity", "cpuset",
         "affinity", "verify_cpuset", "verify_affinity"};
     require(calls == expected,
             "a failed takeover step suppressed or reordered enhanced recovery");
+}
+
+
+void test_restoration_retry() {
+    int attempts = 0;
+    std::vector<int> delays;
+    require(run_restoration_with_retry(
+                3,
+                [&] { return ++attempts == 3; },
+                [&](int attempt) { delays.push_back(attempt); }),
+            "restoration retry did not recover on the final attempt");
+    require(attempts == 3 && delays == std::vector<int>({1, 2}),
+            "restoration retry used incorrect attempt or delay semantics");
+
+    attempts = 0;
+    delays.clear();
+    require(!run_restoration_with_retry(
+                2,
+                [&] { ++attempts; return false; },
+                [&](int attempt) { delays.push_back(attempt); }),
+            "permanent restoration failure was reported as success");
+    require(attempts == 2 && delays == std::vector<int>({1}),
+            "permanent restoration failure exceeded its bound");
+    require(!run_restoration_with_retry(0, [] { return true; }, [](int) {}),
+            "zero restoration attempts unexpectedly ran");
+}
+
+void test_controller_requirements() {
+    Config config;
+    require(!CgroupInitializer::requires_cpuset(config),
+            "empty configuration unexpectedly requires cpuset");
+    require(!CgroupInitializer::requires_cpuctl(config),
+            "empty configuration unexpectedly requires cpuctl");
+
+    config.sched.cpumask["c0"] = {0};
+    config.sched.affinity["little"] = AffinityScene{"c0", "c0", "c0"};
+    ProcessRule rule;
+    rule.name = "app";
+    ThreadRule thread_rule;
+    thread_rule.affinity_class = "little";
+    rule.thread_rules.push_back(thread_rule);
+    config.sched.rules.push_back(rule);
+    require(CgroupInitializer::requires_cpuset(config),
+            "configured affinity did not require cpuset");
+    require(!CgroupInitializer::requires_cpuctl(config),
+            "affinity-only configuration unexpectedly requires cpuctl");
+
+    config.sched.rules[0].thread_rules[0].enable_limit = true;
+    require(CgroupInitializer::requires_cpuctl(config),
+            "configured limit did not require cpuctl");
+}
+
+void test_affinity_takeover_stops_on_identity_change() {
+    std::vector<std::string> calls;
+    int identity_checks = 0;
+    const auto result = CpusetSetter::run_takeover_sequence(
+        1, 2, "c2", {7},
+        [&](int, const std::vector<int>&) {
+            calls.push_back("affinity");
+            return true;
+        },
+        [&](int, const std::string&) {
+            calls.push_back("cpuset");
+            return true;
+        },
+        [&](int) {
+            calls.push_back("parent");
+            return true;
+        },
+        [&](int, int, const std::string&) {
+            calls.push_back("verify_cpuset");
+            return true;
+        },
+        [&](int, const std::vector<int>&) {
+            calls.push_back("verify_affinity");
+            return true;
+        },
+        [&] { return ++identity_checks < 2; });
+    require(!result.success() && result.attempts == 1,
+            "identity change during takeover was reported as success");
+    require(calls == std::vector<std::string>({"affinity"}),
+            "takeover continued mutating a recycled TID");
 }
 
 void test_match_result_equality() {
@@ -543,6 +628,9 @@ int main() {
     test_resolved_affinity_detection();
     test_affinity_takeover_sequence();
     test_affinity_takeover_failure_does_not_short_circuit();
+    test_affinity_takeover_stops_on_identity_change();
+    test_restoration_retry();
+    test_controller_requirements();
     test_match_result_equality();
     test_priority_policy_mapping();
     test_event_router_throttle();

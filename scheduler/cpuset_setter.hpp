@@ -118,7 +118,7 @@ public:
 
     template <typename SetAffinityOperation, typename MoveTargetOperation,
               typename MoveParentOperation, typename VerifyCpusetOperation,
-              typename VerifyAffinityOperation>
+              typename VerifyAffinityOperation, typename IdentityOperation>
     static AffinityTakeoverResult run_takeover_sequence(
         int pid, int tid, const std::string& cpumask_name, const std::vector<int>& expected_cpus,
         SetAffinityOperation&& set_affinity_operation,
@@ -126,28 +126,36 @@ public:
         MoveParentOperation&& move_parent_operation,
         VerifyCpusetOperation&& verify_cpuset_operation,
         VerifyAffinityOperation&& verify_affinity_operation,
+        IdentityOperation&& identity_operation,
         int max_attempts = 2) {
         AffinityTakeoverResult result;
         for (int attempt = 0; attempt < max_attempts; ++attempt) {
+            if (!identity_operation()) break;
             ++result.attempts;
-            // Every state-changing call is independent. In particular, an affinity
-            // failure caused by a disjoint current cpuset never suppresses migration.
+            // Revalidate identity before every state-changing step. This cannot make a
+            // numeric TID an immutable handle, but it bounds the PID/TID reuse window to
+            // one syscall instead of the complete takeover sequence.
             result.pre_affinity_succeeded = set_affinity_operation(tid, expected_cpus);
+            if (!identity_operation()) break;
             result.initial_cpuset_succeeded = move_target_operation(tid, cpumask_name);
             result.cpuset_succeeded = result.initial_cpuset_succeeded;
 
             if (!result.initial_cpuset_succeeded) {
-                // Enhanced recovery: first enter the known top-app parent, then retry the
-                // target child. Affinity is attempted around both writes, without gating.
+                if (!identity_operation()) break;
                 result.recovery_pre_parent_affinity_succeeded =
                     set_affinity_operation(tid, expected_cpus);
+                if (!identity_operation()) break;
                 result.parent_cpuset_succeeded = move_parent_operation(tid);
+                if (!identity_operation()) break;
                 result.recovery_pre_target_affinity_succeeded =
                     set_affinity_operation(tid, expected_cpus);
+                if (!identity_operation()) break;
                 result.cpuset_succeeded = move_target_operation(tid, cpumask_name);
             }
 
+            if (!identity_operation()) break;
             result.post_affinity_succeeded = set_affinity_operation(tid, expected_cpus);
+            if (!identity_operation()) break;
             result.cpuset_verified = verify_cpuset_operation(pid, tid, cpumask_name);
             result.affinity_verified = verify_affinity_operation(tid, expected_cpus);
             if (result.success()) break;
@@ -156,7 +164,9 @@ public:
     }
 
     AffinityTakeoverResult apply_with_result(int pid, int tid, const MatchResult& result,
-                                             [[maybe_unused]] const std::string& cgroup_base) {
+                                             [[maybe_unused]] const std::string& cgroup_base,
+                                             uint64_t process_start_time,
+                                             uint64_t thread_start_time) {
         AffinityTakeoverResult applied;
         if (tid <= 0) {
             LOG_W("CpusetSetter", "Invalid tid: " + std::to_string(tid));
@@ -192,6 +202,11 @@ public:
             },
             [](int target_tid, const std::vector<int>& cpus) {
                 return !CpuMask::is_affinity_changed(target_tid, cpus);
+            },
+            [pid, tid, process_start_time, thread_start_time]() {
+                return FileUtils::get_process_start_time(pid) == process_start_time
+                    && FileUtils::get_thread_start_time(pid, tid) == thread_start_time
+                    && FileUtils::is_thread_in_process(pid, tid);
             });
 
         if (!applied.success()) {

@@ -491,8 +491,19 @@ private:
         // Mark every requested dimension as managed after attempting it: a failed call
         // can still have changed an earlier syscall or moved the thread partway.
         const AffinityTakeoverResult affinity_result =
-            cpuset.apply_with_result(task.pid, task.tid, result, cpuset_base);
+            cpuset.apply_with_result(task.pid, task.tid, result, cpuset_base,
+                                     task.process_start_time, task.thread_start_time);
+        if (!is_current_task_identity(task)) {
+            cache.erase_thread_if_identity(task.pid, task.tid, task.process_start_time,
+                                           task.thread_start_time);
+            return;
+        }
         const bool priority_applied = prio.apply_with_result(task.pid, task.tid, result);
+        if (!is_current_task_identity(task)) {
+            cache.erase_thread_if_identity(task.pid, task.tid, task.process_start_time,
+                                           task.thread_start_time);
+            return;
+        }
         const bool cpuctl_applied = cpuctl.apply_with_result(task.pid, task.tid, result);
         managed.affinity = managed.affinity || needs_affinity;
         managed.priority = managed.priority || needs_priority;

@@ -21,16 +21,16 @@ jobs:
 
     steps:
     - name: Checkout Repository
-      uses: actions/checkout@v5
+      uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
     - name: Clean Build Directory
       run: |
         rm -rf build CMakeCache.txt CMakeFiles cmake_install.cmake
         echo "Cleaned build artifacts"
 
-    - uses: android-actions/setup-android@v3
+    - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
 
-    - uses: nttld/setup-ndk@v1
+    - uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
       id: setup-ndk
       with:
         ndk-version: r26b
@@ -85,7 +85,7 @@ jobs:
           --output out
 
     - name: Upload Binary Artifact
-      uses: actions/upload-artifact@v5
+      uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
       with:
         name: thread_scheduler-${{ matrix.arch }}-${{ matrix.build_type }}
         path: build/thread_scheduler
@@ -93,7 +93,7 @@ jobs:
         if-no-files-found: error
 
     - name: Upload Module Zip Artifact
-      uses: actions/upload-artifact@v5
+      uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
       with:
         name: ReUperf-module-${{ matrix.arch }}-${{ matrix.build_type }}
         path: out/ReUperf-*.zip
@@ -103,7 +103,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout Repository
-      uses: actions/checkout@v5
+      uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
     - name: Install Build Dependencies
       run: |

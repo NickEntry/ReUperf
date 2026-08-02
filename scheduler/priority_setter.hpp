@@ -38,7 +38,7 @@ public:
         priority = param.sched_priority;
         if (policy == normal_policy() || policy == batch_policy() || policy == idle_policy()) {
             errno = 0;
-            nice = getpriority(PRIO_PROCESS, tid);
+            nice = getpriority(PRIO_PROCESS, static_cast<id_t>(tid));
             if (errno != 0) {
                 return false;
             }
@@ -62,7 +62,7 @@ public:
 
         if (curr.policy == normal_policy() || curr.policy == batch_policy() || curr.policy == idle_policy()) {
             errno = 0;
-            int nice = getpriority(PRIO_PROCESS, tid);
+            int nice = getpriority(PRIO_PROCESS, static_cast<id_t>(tid));
             if (errno == 0) {
                 curr.prio = nice + 120;
             }
@@ -254,7 +254,7 @@ private:
     }
     
     bool set_nice_value(int tid, int nice) {
-        if (setpriority(PRIO_PROCESS, tid, nice) != 0) {
+        if (setpriority(PRIO_PROCESS, static_cast<id_t>(tid), nice) != 0) {
             LOG_W("PrioritySetter", "Failed to set nice " + std::to_string(nice) 
                   + " for tid " + std::to_string(tid));
             return false;

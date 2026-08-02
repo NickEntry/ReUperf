@@ -170,6 +170,8 @@ out/ReUperf-{ABI}-{dynamic|static}-{版本时间}.zip
 - 支持 ABI：`arm64-v8a`、`armeabi-v7a`、`x86_64`、`x86`。
 - **dynamic** 模块会从 Android NDK 打包同 ABI 的 `libc++_shared.so`；模块启动脚本会设置 `LD_LIBRARY_PATH=/data/adb/ReUperf`。
 - **static** 模块不包含 `libc++_shared.so`。
+- 打包器使用 `llvm-readelf` 或 `readelf` 验证 ELF 架构、Android NDK 标识、动态解释器和链接类型；ABI、Android 目标或 `dynamic`/`static` 声明不一致时直接拒绝打包。
+- `META-INF/com/google/android/update-binary` 是仓库内维护的 MIT 许可安装入口，打包过程不下载或嵌入远程安装脚本，因此相同源码和二进制可重复生成相同安装逻辑。
 - 模块安装和开机服务将二进制放在 `/data/adb/ReUperf/thread_scheduler`。首次安装会复制默认配置到 `/data/adb/ReUperf/ReUperf.json`；之后模块更新会保留用户已修改的配置。
 
 也可以在已有二进制时单独打包：

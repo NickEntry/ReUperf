@@ -145,7 +145,14 @@ private:
             }
             if (poll_fds[1].revents & POLLIN) {
                 uint64_t ignored = 0;
-                (void)read(stop_fd_, &ignored, sizeof(ignored));
+                ssize_t bytes_read;
+                do {
+                    bytes_read = read(stop_fd_, &ignored, sizeof(ignored));
+                } while (bytes_read < 0 && errno == EINTR);
+                if (bytes_read < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    LOG_W("ProcMonitor", "Failed to consume stop signal: "
+                          + std::string(strerror(errno)));
+                }
                 break;
             }
             if (!(poll_fds[0].revents & POLLIN)) {

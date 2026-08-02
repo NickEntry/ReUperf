@@ -93,6 +93,34 @@ public:
         return !cpus.empty() && !mems.empty();
     }
 
+    static bool requires_cpuset(const Config& config) {
+        for (const auto& rule : config.sched.rules) {
+            for (const auto& thread_rule : rule.thread_rules) {
+                if (thread_rule.affinity_class.empty() || thread_rule.affinity_class == "auto") {
+                    continue;
+                }
+                const auto affinity = config.sched.affinity.find(thread_rule.affinity_class);
+                if (affinity != config.sched.affinity.end()
+                    && (!affinity->second.bg.empty() || !affinity->second.fg.empty()
+                        || !affinity->second.top.empty())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    static bool requires_cpuctl(const Config& config) {
+        for (const auto& rule : config.sched.rules) {
+            for (const auto& thread_rule : rule.thread_rules) {
+                if (thread_rule.enable_limit) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     static std::string cpuset_parent_path() {
         return "/dev/cpuset/top-app";
     }
@@ -198,9 +226,13 @@ private:
     static bool init_cpuset(const Config& config, ControlFileTransaction& transaction) {
         LOG_I("CgroupInit", "Initializing cpuset cgroups...");
 
-        if (!FileUtils::dir_exists("/dev/cpuset")) {
-            LOG_W("CgroupInit", "/dev/cpuset not found, skipping cpuset init");
+        if (!requires_cpuset(config)) {
+            LOG_I("CgroupInit", "No configured affinity requires cpuset; skipping cpuset init");
             return true;
+        }
+        if (!FileUtils::dir_exists("/dev/cpuset")) {
+            LOG_E("CgroupInit", "/dev/cpuset is required by configured affinity rules");
+            return false;
         }
         const std::string base_path = cpuset_parent_path();
         if (!FileUtils::dir_exists(base_path)
@@ -286,9 +318,13 @@ private:
     static bool init_cpuctl(const Config& config, ControlFileTransaction& transaction) {
         LOG_I("CgroupInit", "Initializing cpuctl cgroups...");
 
-        if (!FileUtils::dir_exists("/dev/cpuctl")) {
-            LOG_W("CgroupInit", "/dev/cpuctl not found, skipping cpuctl init");
+        if (!requires_cpuctl(config)) {
+            LOG_I("CgroupInit", "No configured limit requires cpuctl; skipping cpuctl init");
             return true;
+        }
+        if (!FileUtils::dir_exists("/dev/cpuctl")) {
+            LOG_E("CgroupInit", "/dev/cpuctl is required by configured limit rules");
+            return false;
         }
 
         const std::string reuperf_path = "/dev/cpuctl/ReUperf";

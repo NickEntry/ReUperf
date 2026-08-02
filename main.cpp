@@ -37,6 +37,7 @@
 #include "core/thread_matcher.hpp"
 #include "core/thread_cache.hpp"
 #include "core/scan_worker.hpp"
+#include "core/restoration_retry.hpp"
 #include "scheduler/cpuset_setter.hpp"
 #include "scheduler/priority_setter.hpp"
 #include "scheduler/cpuctl_setter.hpp"
@@ -1329,13 +1330,29 @@ int main(int argc, char* argv[]) {
     g_event_router->stop();
     
     stop_all_workers(workers, "Stopping workers for shutdown");
-    restore_all_thread_baselines(*cache_ptr, *cpuset_ptr, *prio_ptr, *cpuctl_ptr);
-    cache_ptr->clear();
+    constexpr int kShutdownRestoreAttempts = 3;
+    constexpr int kShutdownRestoreDelayMs = 50;
+    const bool shutdown_restored = restore_with_bounded_retry(
+        kShutdownRestoreAttempts, kShutdownRestoreDelayMs,
+        [&]() {
+            return restore_all_thread_baselines(
+                *cache_ptr, *cpuset_ptr, *prio_ptr, *cpuctl_ptr);
+        });
+    if (!shutdown_restored) {
+        LOG_E("Main", "Shutdown baseline restoration remained incomplete after "
+              + std::to_string(kShutdownRestoreAttempts)
+              + " attempts; preserving unrestored baseline records until process exit");
+    }
+    if (shutdown_restored) {
+        cache_ptr->clear();
+    }
     
-    if (shutdown_requested.load(std::memory_order_seq_cst)) {
+    if (!shutdown_restored) {
+        LOG_E("Main", "ReUperf Thread Scheduler stopped with incomplete baseline restoration");
+    } else if (shutdown_requested.load(std::memory_order_seq_cst)) {
         LOG_I("Main", "ReUperf Thread Scheduler stopped (signal)");
     } else {
         LOG_I("Main", "ReUperf Thread Scheduler stopped");
     }
-    return 0;
+    return shutdown_restored ? 0 : 2;
 }

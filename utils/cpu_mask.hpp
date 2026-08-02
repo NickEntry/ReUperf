@@ -23,7 +23,7 @@ public:
         CPU_ZERO(&set);
         for (int cpu : cpus) {
             if (cpu >= 0 && cpu < CPU_SETSIZE) {
-                CPU_SET(cpu, &set);
+                CPU_SET(static_cast<size_t>(cpu), &set);
             }
         }
         return set;
@@ -32,7 +32,7 @@ public:
     static std::vector<int> to_vector(const cpu_set_t& set) {
         std::vector<int> cpus;
         for (int i = 0; i < CPU_SETSIZE; ++i) {
-            if (CPU_ISSET(i, &set)) {
+            if (CPU_ISSET(static_cast<size_t>(i), &set)) {
                 cpus.push_back(i);
             }
         }
